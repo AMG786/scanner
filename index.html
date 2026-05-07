@@ -1,241 +1,203 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
+
+<head>
     <meta charset="UTF-8" />
     <title>jscanify Document Scanner Demo</title>
     <style>
-      body {
-        font-family: sans-serif;
-        padding: 20px;
-        max-width: 900px;
-        margin: auto;
-      }
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+            max-width: 900px;
+            margin: auto;
+        }
 
-      canvas,
-      video {
-        display: block;
-        margin-top: 20px;
-        border: 1px solid #ccc;
-        max-width: 100%;
-        height: auto;
-      }
+        canvas,
+        video {
+            display: block;
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            max-width: 100%;
+            height: auto;
+        }
 
-      pre {
-        background: #f0f0f0;
-        padding: 10px;
-        margin-top: 10px;
-        white-space: pre-wrap;
-      }
+        pre {
+            background: #f0f0f0;
+            padding: 10px;
+            margin-top: 10px;
+            white-space: pre-wrap;
+        }
 
-      button.save-btn,
-      button#startCameraBtn,
-      button#captureBtn {
-        margin-top: 10px;
-        padding: 8px 16px;
-        cursor: pointer;
-        background-color: #007bff;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        font-size: 14px;
-      }
+        button.save-btn,
+        button#startCameraBtn,
+        button#captureBtn {
+            margin-top: 10px;
+            padding: 8px 16px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+        }
 
-      #cameraContainer {
-        margin-top: 40px;
-      }
+        #cameraContainer {
+            margin-top: 40px;
+        }
     </style>
-  </head>
+</head>
 
-  <body>
+<body>
     <h1>jscanify Document Scanner Demo</h1>
 
     <!-- SCAN FROM FILE -->
-    <h2>Scan From File :</h2>
+    <h2>Scan From File</h2>
     <input type="file" id="fileInput" accept="image/*" />
     <div id="uploadPreview"></div>
 
     <!-- LIVE DETECTION -->
     <h2>Live Detection</h2>
     <button id="startCameraBtn">Start Camera</button>
-    <div id="cameraContainer" style="display: none">
-      <video id="video" autoplay playsinline></video>
-      <canvas id="highlightCanvas"></canvas>
-      <button id="captureBtn">📸 Capture Scanned Document</button>
-      <div id="cameraResult"></div>
+    <div id="cameraContainer" style="display:none;">
+        <video id="video" autoplay playsinline></video>
+        <canvas id="highlightCanvas"></canvas>
+        <button id="captureBtn">📸 Capture Scanned Document</button>
+        <div id="cameraResult"></div>
     </div>
 
     <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/ColonelParrot/jscanify@master/src/jscanify.min.js"></script>
 
     <script>
-      window.addEventListener("load", () => {
-        const scanner = new jscanify();
-        // 👇 ADD FUNCTION HERE (outside all event listeners)
-        function enhanceImage(canvas) {
-          const ctx = canvas.getContext("2d");
-          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const data = imageData.data;
+        window.addEventListener("load", () => {
+            const scanner = new jscanify();
 
-          const contrast = 1.5; // 🔥 increase this for darker text
-          const brightness = 40; // small lift for paper whiteness
+            // --- SCAN FROM FILE ---
+            const fileInput = document.getElementById("fileInput");
+            const uploadPreview = document.getElementById("uploadPreview");
 
-          for (let i = 0; i < data.length; i += 4) {
-            for (let j = 0; j < 3; j++) {
-              let value = data[i + j];
+            fileInput.addEventListener("change", e => {
+                const file = e.target.files[0];
+                if (!file) return;
 
-              // contrast formula (core trick)
-              value = (value - 128) * contrast + 128;
+                const img = new Image();
+                img.onload = () => {
+                    uploadPreview.innerHTML = "";
 
-              // brightness adjustment
-              value += brightness;
+                    // Highlighting
+                    const hl = scanner.highlightPaper(img);
+                    uploadPreview.appendChild(hl);
 
-              // clamp
-              data[i + j] = Math.max(0, Math.min(255, value));
-            }
-          }
+                    // Extracting
+                    const scan = scanner.extractPaper(img, 500, 700);
+                    uploadPreview.appendChild(scan);
 
-          ctx.putImageData(imageData, 0, 0);
-          return canvas;
-        }
+                    // Save button
+                    const saveBtn = document.createElement("button");
+                    saveBtn.textContent = "💾 Save Scanned Image";
+                    saveBtn.className = "save-btn";
+                    saveBtn.addEventListener("click", () => {
+                        const dataUrl = scan.toDataURL("image/png");
+                        const a = document.createElement("a");
+                        a.href = dataUrl;
+                        a.download = "scanned_document.png";
+                        a.click();
+                    });
+                    uploadPreview.appendChild(saveBtn);
 
-        // --- SCAN FROM FILE ---
-        const fileInput = document.getElementById("fileInput");
-        const uploadPreview = document.getElementById("uploadPreview");
-
-        fileInput.addEventListener("change", (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
-
-          const img = new Image();
-          img.onload = () => {
-            uploadPreview.innerHTML = "";
-
-            // Highlighting
-            const hl = scanner.highlightPaper(img);
-            uploadPreview.appendChild(hl);
-
-            // Extracting
-            const scan = scanner.extractPaper(img, 500, 700);
-
-            const enhanced = enhanceImage(scan);
-            uploadPreview.appendChild(enhanced);
-
-            // Save button
-            const saveBtn = document.createElement("button");
-            saveBtn.textContent = "💾 Save Scanned Image";
-            saveBtn.className = "save-btn";
-            saveBtn.addEventListener("click", () => {
-              const dataUrl = scan.toDataURL("image/png");
-              const a = document.createElement("a");
-              a.href = dataUrl;
-              a.download = "scanned_document.png";
-              a.click();
+                    // Corner points
+                    const mat = cv.imread(img);
+                    const contour = scanner.findPaperContour(mat);
+                    const corners = scanner.getCornerPoints(contour);
+                    const pre = document.createElement("pre");
+                    pre.textContent = JSON.stringify(corners, null, 2);
+                    uploadPreview.appendChild(pre);
+                };
+                img.src = URL.createObjectURL(file);
             });
-            uploadPreview.appendChild(saveBtn);
 
-            // Corner points
-            const mat = cv.imread(img);
-            const contour = scanner.findPaperContour(mat);
-            const corners = scanner.getCornerPoints(contour);
-            const pre = document.createElement("pre");
-            pre.textContent = JSON.stringify(corners, null, 2);
-            uploadPreview.appendChild(pre);
-          };
-          img.src = URL.createObjectURL(file);
-        });
+            // --- LIVE DETECTION ---
+            const startCameraBtn = document.getElementById("startCameraBtn");
+            const cameraContainer = document.getElementById("cameraContainer");
+            const video = document.getElementById("video");
+            const highlightCanvas = document.getElementById("highlightCanvas");
+            const captureBtn = document.getElementById("captureBtn");
+            const cameraResult = document.getElementById("cameraResult");
+            let stream = null;
+            let highlightInterval = null;
 
-        // --- LIVE DETECTION ---
-        const startCameraBtn = document.getElementById("startCameraBtn");
-        const cameraContainer = document.getElementById("cameraContainer");
-        const video = document.getElementById("video");
-        const highlightCanvas = document.getElementById("highlightCanvas");
-        const captureBtn = document.getElementById("captureBtn");
-        const cameraResult = document.getElementById("cameraResult");
-        let stream = null;
-        let highlightInterval = null;
+            startCameraBtn.addEventListener("click", async () => {
+                if (stream) {
+                    // Stop camera if running
+                    stream.getTracks().forEach(track => track.stop());
+                    stream = null;
+                    cameraContainer.style.display = "none";
+                    startCameraBtn.textContent = "Start Camera";
+                    clearInterval(highlightInterval);
+                    return;
+                }
 
-        startCameraBtn.addEventListener("click", async () => {
-          if (stream) {
-            // Stop camera if running
-            stream.getTracks().forEach((track) => track.stop());
-            stream = null;
-            cameraContainer.style.display = "none";
-            startCameraBtn.textContent = "Start Camera";
-            clearInterval(highlightInterval);
-            return;
-          }
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+                    video.srcObject = stream;
+                    await video.play();
+                    cameraContainer.style.display = "block";
+                    startCameraBtn.textContent = "Stop Camera";
 
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
+                    const ctx = highlightCanvas.getContext("2d");
+
+                    // Resize canvas to video size
+                    highlightCanvas.width = video.videoWidth;
+                    highlightCanvas.height = video.videoHeight;
+
+                    // Continuous highlight loop
+                    highlightInterval = setInterval(() => {
+                        ctx.drawImage(video, 0, 0, highlightCanvas.width, highlightCanvas.height);
+                        const hlCanvas = scanner.highlightPaper(highlightCanvas);
+                        // Clear and draw highlight result on highlightCanvas
+                        ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+                        ctx.drawImage(hlCanvas, 0, 0);
+                    }, 100); // 10 fps approx
+
+                } catch (err) {
+                    alert("Error accessing camera: " + err.message);
+                }
             });
-            video.srcObject = stream;
-            await video.play();
-            cameraContainer.style.display = "block";
-            startCameraBtn.textContent = "Stop Camera";
 
-            const ctx = highlightCanvas.getContext("2d");
+            captureBtn.addEventListener("click", () => {
+                if (!stream) return;
 
-            // Resize canvas to video size
-            highlightCanvas.width = video.videoWidth;
-            highlightCanvas.height = video.videoHeight;
+                // Extract scanned document from the current highlighted canvas
+                cameraResult.innerHTML = "";
 
-            // Continuous highlight loop
-            highlightInterval = setInterval(() => {
-              ctx.drawImage(
-                video,
-                0,
-                0,
-                highlightCanvas.width,
-                highlightCanvas.height,
-              );
-              const hlCanvas = scanner.highlightPaper(highlightCanvas);
-              // Clear and draw highlight result on highlightCanvas
-              ctx.clearRect(
-                0,
-                0,
-                highlightCanvas.width,
-                highlightCanvas.height,
-              );
-              ctx.drawImage(hlCanvas, 0, 0);
-            }, 100); // 10 fps approx
-          } catch (err) {
-            alert("Error accessing camera: " + err.message);
-          }
+                // Extract paper from highlightCanvas (which has current video frame)
+                const scan = scanner.extractPaper(highlightCanvas, 500, 700);
+                cameraResult.appendChild(scan);
+
+                // Save button for camera scan
+                const saveBtn = document.createElement("button");
+                saveBtn.textContent = "💾 Save Scanned Image";
+                saveBtn.className = "save-btn";
+                saveBtn.addEventListener("click", () => {
+                    const dataUrl = scan.toDataURL("image/png");
+                    const a = document.createElement("a");
+                    a.href = dataUrl;
+                    a.download = "scanned_document.png";
+                    a.click();
+                });
+                cameraResult.appendChild(saveBtn);
+
+                // Corner points
+                const mat = cv.imread(highlightCanvas);
+                const contour = scanner.findPaperContour(mat);
+                const corners = scanner.getCornerPoints(contour);
+                const pre = document.createElement("pre");
+                pre.textContent = JSON.stringify(corners, null, 2);
+                cameraResult.appendChild(pre);
+            });
+
         });
-
-        captureBtn.addEventListener("click", () => {
-          if (!stream) return;
-
-          // Extract scanned document from the current highlighted canvas
-          cameraResult.innerHTML = "";
-
-          // Extract paper from highlightCanvas (which has current video frame)
-          const scan = scanner.extractPaper(highlightCanvas, 500, 700);
-          cameraResult.appendChild(scan);
-
-          // Save button for camera scan
-          const saveBtn = document.createElement("button");
-          saveBtn.textContent = "💾 Save Scanned Image";
-          saveBtn.className = "save-btn";
-          saveBtn.addEventListener("click", () => {
-            const dataUrl = scan.toDataURL("image/png");
-            const a = document.createElement("a");
-            a.href = dataUrl;
-            a.download = "scanned_document.png";
-            a.click();
-          });
-          cameraResult.appendChild(saveBtn);
-
-          // Corner points
-          const mat = cv.imread(highlightCanvas);
-          const contour = scanner.findPaperContour(mat);
-          const corners = scanner.getCornerPoints(contour);
-          const pre = document.createElement("pre");
-          pre.textContent = JSON.stringify(corners, null, 2);
-          cameraResult.appendChild(pre);
-        });
-      });
     </script>
-  </body>
+</body>
+
 </html>
