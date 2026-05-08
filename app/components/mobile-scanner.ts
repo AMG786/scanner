@@ -157,8 +157,17 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			this.highlightInterval = setInterval(() => {
 				if (!video.videoWidth || !video.videoHeight) return
 
-				if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
-				if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
+				// Draw at screen size, not raw camera resolution (e.g. 1920×1080).
+				// This keeps the preview fitting the phone screen without overflow.
+				const displayW = canvas.clientWidth || window.innerWidth
+				const displayH = canvas.clientHeight || window.innerHeight
+				const aspect = video.videoWidth / video.videoHeight
+
+				const drawW = displayW
+				const drawH = Math.round(displayW / aspect)
+
+				if (canvas.width !== drawW) canvas.width = drawW
+				if (canvas.height !== drawH) canvas.height = drawH
 
 				try {
 					ctx.drawImage(video, 0, 0, canvas.width, canvas.height)

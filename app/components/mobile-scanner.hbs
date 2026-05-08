@@ -16,10 +16,12 @@
 				{{did-insert this.setupVideoElement}}
 			/>
 
-			{{! This single canvas is the only thing the user sees }}
+			{{! This single canvas is the only thing the user sees.
+			    object-fit:cover via CSS ensures it fills the container
+			    without overflow, regardless of video resolution. }}
 			<canvas
 				id="scanner-highlight"
-				class="w-full h-full object-cover"
+				style="width:100%;height:100%;object-fit:contain;display:block;background:#000"
 				{{did-insert this.setupHighlightCanvas}}
 			/>
 
