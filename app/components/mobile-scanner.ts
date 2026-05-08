@@ -274,7 +274,20 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	// ── Image enhancement ──────────────────────────────────────────────
 
-	// Applies contrast + brightness boost so paper becomes white and text stays dark.
+	/**
+	 * Produces a clean, professional "scanned document" look:
+	 *
+	 * 1. Adaptive threshold — estimates the local background brightness across
+	 *    a grid of tiles and normalises each tile independently. This is what
+	 *    makes uneven lighting (stairwell shadows, harsh sunlight on one corner)
+	 *    disappear and turns the paper a uniform white.
+	 *
+	 * 2. Contrast stretch — after normalisation the histogram is compressed;
+	 *    a gentle contrast boost re-separates ink from paper.
+	 *
+	 * 3. White-point clamp — pixels above a high threshold are forced to pure
+	 *    white, eliminating residual grey cast on the paper.
+	 */
 	private enhanceImage(canvas: HTMLCanvasElement): HTMLCanvasElement {
 		const out = document.createElement("canvas")
 		out.width = canvas.width
@@ -285,13 +298,90 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		ctx.drawImage(canvas, 0, 0)
 		const imageData = ctx.getImageData(0, 0, out.width, out.height)
 		const data = imageData.data
-		const contrast = 1.5
-		const brightness = 40
+		const w = out.width
+		const h = out.height
 
-		for (let i = 0; i < data.length; i += 4) {
-			for (let j = 0; j < 3; j++) {
-				const raw = data[i + j] ?? 0
-				data[i + j] = Math.max(0, Math.min(255, (raw - 128) * contrast + 128 + brightness))
+		// ── Step 1: convert to greyscale luminance map ──────────────────
+		const grey = new Float32Array(w * h)
+		for (let i = 0; i < w * h; i++) {
+			const r = data[i * 4] ?? 0
+			const g = data[i * 4 + 1] ?? 0
+			const b = data[i * 4 + 2] ?? 0
+			grey[i] = 0.299 * r + 0.587 * g + 0.114 * b
+		}
+
+		// ── Step 2: estimate background via a coarse tile grid ──────────
+		// Each tile's 90th-percentile luminance ≈ background brightness.
+		// We bilinearly interpolate between tile centres to get a smooth
+		// background map — this is the core of adaptive thresholding.
+		const TILES = 8 // 8×8 grid
+		const tileW = Math.ceil(w / TILES)
+		const tileH = Math.ceil(h / TILES)
+		const bg = new Float32Array((TILES + 1) * (TILES + 1))
+
+		for (let ty = 0; ty <= TILES; ty++) {
+			for (let tx = 0; tx <= TILES; tx++) {
+				// Clamp tile bounds to image edges
+				const x0 = Math.min(tx * tileW, w - 1)
+				const y0 = Math.min(ty * tileH, h - 1)
+				const x1 = Math.min(x0 + tileW, w)
+				const y1 = Math.min(y0 + tileH, h)
+
+				// Collect luminance samples in this tile
+				const samples: number[] = []
+				for (let y = y0; y < y1; y++) {
+					for (let x = x0; x < x1; x++) {
+						samples.push(grey[y * w + x] ?? 0)
+					}
+				}
+				samples.sort((a, b) => a - b)
+				// 90th percentile ≈ paper brightness in this region
+				const p90idx = Math.floor(samples.length * 0.9)
+				bg[ty * (TILES + 1) + tx] = samples[p90idx] ?? 255
+			}
+		}
+
+		// ── Step 3: apply adaptive normalisation + contrast ─────────────
+		const CONTRAST = 1.8 // increase ink-to-paper separation
+		const WHITE_CLAMP = 240 // pixels brighter than this → pure white
+
+		for (let y = 0; y < h; y++) {
+			// Tile-space y coordinate (fractional)
+			const ty = (y / tileH)
+			const ty0 = Math.floor(ty)
+			const ty1 = Math.min(ty0 + 1, TILES)
+			const fy = ty - ty0
+
+			for (let x = 0; x < w; x++) {
+				const tx = (x / tileW)
+				const tx0 = Math.floor(tx)
+				const tx1 = Math.min(tx0 + 1, TILES)
+				const fx = tx - tx0
+
+				// Bilinear interpolation of background brightness
+				const b00 = bg[ty0 * (TILES + 1) + tx0] ?? 255
+				const b10 = bg[ty0 * (TILES + 1) + tx1] ?? 255
+				const b01 = bg[ty1 * (TILES + 1) + tx0] ?? 255
+				const b11 = bg[ty1 * (TILES + 1) + tx1] ?? 255
+				const bgVal =
+					b00 * (1 - fx) * (1 - fy) +
+					b10 * fx * (1 - fy) +
+					b01 * (1 - fx) * fy +
+					b11 * fx * fy
+
+				const idx = (y * w + x) * 4
+
+				for (let c = 0; c < 3; c++) {
+					const raw = data[idx + c] ?? 0
+					// Normalise: scale so that bgVal maps to 255 (paper → white)
+					let norm = (raw / Math.max(bgVal, 1)) * 255
+					// Contrast stretch around midpoint
+					norm = (norm - 128) * CONTRAST + 128
+					// White-point clamp: near-white → pure white
+					if (norm > WHITE_CLAMP) norm = 255
+					data[idx + c] = Math.max(0, Math.min(255, Math.round(norm)))
+				}
+				// alpha unchanged
 			}
 		}
 
