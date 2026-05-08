@@ -1,0 +1,190 @@
+{{! Full-screen scanner overlay }}
+<div class="fixed inset-0 z-50 bg-black flex flex-col">
+
+	{{#if this.isCameraOpen}}
+		{{! Camera view }}
+		<div class="relative flex-1 overflow-hidden">
+			{{! Hidden video provides the MediaStream — not shown directly }}
+			<video
+				id="scanner-video"
+				autoplay
+				playsinline
+				muted
+				class="hidden absolute"
+				{{did-insert this.setupVideoElement}}
+			/>
+			{{! Canvas shows live video frames + jscanify document outline highlight }}
+			<canvas
+				id="scanner-highlight"
+				class="w-full h-full object-cover"
+				{{did-insert this.setupHighlightCanvas}}
+			/>
+
+			{{! Capture controls }}
+			<div class="absolute bottom-0 inset-x-0 pb-10 flex justify-around items-center bg-gradient-to-t from-black/60 to-transparent pt-12">
+				<button
+					type="button"
+					class="text-white text-sm uppercase tracking-wide cursor-pointer"
+					{{on "click" this.stopCamera}}
+				>
+					Cancel
+				</button>
+
+				{{! Shutter button }}
+				<button
+					type="button"
+					aria-label="Capture photo"
+					class="
+						w-18 h-18 rounded-full
+						border-4 border-white
+						bg-white/20
+						flex items-center justify-center
+						cursor-pointer
+						active:scale-95 transition-transform
+					"
+					{{on "click" this.capturePhoto}}
+				>
+					<div class="w-14 h-14 bg-white rounded-full" />
+				</button>
+
+				<div class="w-16" />{{! spacer to centre shutter button }}
+			</div>
+		</div>
+
+	{{else}}
+		{{! Preview and controls view }}
+
+		{{! Header }}
+		<div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white">
+			<button
+				type="button"
+				class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
+				{{on "click" this.handleClose}}
+			>
+				<i class="ri-close-line mr-1" />Cancel
+			</button>
+
+			<div class="text-sm font-semibold">
+				{{this.capturedImages.length}}
+				{{#if (eq this.capturedImages.length 1)}}page{{else}}pages{{/if}}
+				captured
+			</div>
+
+			{{#if this.isAtPageLimit}}
+				<span class="text-xs text-yellow-400">Max 20 pages</span>
+			{{else}}
+				<button
+					type="button"
+					class="text-sm uppercase tracking-wide cursor-pointer text-white"
+					{{on "click" this.openCamera}}
+				>
+					<i class="ri-add-line" />Add Page
+				</button>
+			{{/if}}
+		</div>
+
+		{{#if this.capturedImages.length}}
+			{{! Page thumbnails }}
+			<div class="flex-1 overflow-y-auto p-4 grid grid-cols-2 gap-4 bg-gray-950">
+				{{#each this.capturedImagesWithIndex as |item|}}
+					<div class="relative flex flex-col gap-1">
+						<img
+							src={{item.url}}
+							alt="Page {{item.pageNumber}}"
+							class="w-full rounded-md border border-gray-700 object-cover"
+						/>
+						<button
+							type="button"
+							aria-label="Remove page {{item.pageNumber}}"
+							class="
+								absolute top-1 right-1
+								w-6 h-6 rounded-full
+								bg-red-600 text-white text-xs
+								flex items-center justify-center
+								cursor-pointer
+							"
+							{{on "click" (fn this.removePage item.index)}}
+						>
+							<i class="ri-close-line" />
+						</button>
+						<div class="text-center text-gray-400 text-xs">
+							Page {{item.pageNumber}}
+						</div>
+					</div>
+				{{/each}}
+			</div>
+
+			{{! Upload button }}
+			<div class="p-4 bg-gray-900">
+				<button
+					type="button"
+					class="
+						w-full bg-white text-black
+						py-4 rounded-lg
+						font-semibold uppercase tracking-wide
+						cursor-pointer
+						disabled:opacity-50 disabled:cursor-not-allowed
+					"
+					disabled={{this.isGenerating}}
+					{{on "click" this.generatePDF}}
+				>
+					{{#if this.isGenerating}}
+						<i class="ri-loader-4-line animate-spin mr-2" />Generating PDF...
+					{{else}}
+						<i class="ri-upload-cloud-line mr-2" />
+						Upload
+						{{this.capturedImages.length}}
+						{{#if (eq this.capturedImages.length 1)}}Page{{else}}Pages{{/if}}
+						as PDF
+					{{/if}}
+				</button>
+			</div>
+
+		{{else}}
+			{{! Empty state - no pages yet }}
+			<div class="flex-1 flex flex-col justify-center items-center gap-6 text-white bg-gray-950">
+				<i class="ri-file-scan-line text-6xl text-gray-500" />
+				<div class="text-center">
+					<div class="text-xl font-semibold">No pages captured yet</div>
+					<div class="text-gray-400 text-sm mt-1">Tap the button below to open the camera</div>
+				</div>
+
+				{{#if this.cameraError}}
+					<div class="bg-red-900/50 border border-red-700 rounded-md px-4 py-3 text-red-300 text-sm text-center max-w-xs">
+						{{this.cameraError}}
+					</div>
+				{{/if}}
+
+				<div class="flex gap-3">
+					{{! Open camera }}
+					<button
+						type="button"
+						class="bg-white text-black px-8 py-3 rounded-full font-semibold cursor-pointer"
+						{{on "click" this.openCamera}}
+					>
+						<i class="ri-camera-line mr-2" />Start Scanning
+					</button>
+
+					{{! Load from file - for desktop testing }}
+					<button
+						type="button"
+						class="bg-gray-700 text-white px-8 py-3 rounded-full font-semibold cursor-pointer"
+						{{on "click" this.loadFromFile}}
+					>
+						<i class="ri-image-line mr-2" />Load from File
+					</button>
+				</div>
+
+				{{! Hidden file input triggered by loadFromFile button }}
+				<input
+					type="file"
+					accept="image/*"
+					class="hidden"
+					id="scanner-file-input"
+					{{on "change" this.processFileInput}}
+				/>
+			</div>
+		{{/if}}
+	{{/if}}
+
+</div>
