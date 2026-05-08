@@ -39,12 +39,9 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		return this.capturedImages.length >= MobileScannerComponent.MAX_PAGES
 	}
 
-	// ── iOS detection ──────────────────────────────────────────────────
-
 	private get isIOS(): boolean {
 		return (
 			/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-			// iPad OS 13+ reports as MacIntel with touch support
 			(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
 		)
 	}
@@ -67,22 +64,14 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	private waitForOpenCV(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			// iOS Safari has stricter Wasm init time — give it 15s
-			const timeout = setTimeout(() => {
-				reject(new Error("OpenCV timed out"))
-			}, 15000)
-
+			const timeout = setTimeout(() => reject(new Error("OpenCV timed out")), 15000)
 			const check = () => {
-				// biome-ignore lint/suspicious/noExplicitAny: opencv global
 				const cv = (window as any).cv
 				if (cv && cv.Mat) {
 					clearTimeout(timeout)
 					resolve()
 				} else if (cv && cv.onRuntimeInitialized !== undefined) {
-					cv.onRuntimeInitialized = () => {
-						clearTimeout(timeout)
-						resolve()
-					}
+					cv.onRuntimeInitialized = () => { clearTimeout(timeout); resolve() }
 				} else {
 					setTimeout(check, 100)
 				}
@@ -101,12 +90,10 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			await this.loadScript(
 				"https://cdn.jsdelivr.net/gh/ColonelParrot/jscanify@master/src/jscanify.min.js",
 			)
-			// biome-ignore lint/suspicious/noExplicitAny: jscanify global
 			this.scanner = new (window as any).jscanify()
 			this.libsReady = true
 		} catch (e) {
 			console.warn("Scanner libs failed to load, will use raw capture:", e)
-			// Camera still works — just no outline highlight
 		} finally {
 			this.libsLoading = false
 		}
@@ -118,158 +105,48 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		if (this.isAtPageLimit) return
 		this.cameraError = null
 
-		// Start loading libs in background — don't block camera open
-		this.loadScannerLibs().catch(() => {/* handled inside */})
+		this.loadScannerLibs().catch(() => {})
 
 		try {
-			// iOS Safari is strict about constraints.
-			// Use `ideal` (never `exact`) to avoid OverconstrainedError.
-			// Keep it simple on iOS — extra constraints trigger silent failures.
 			const constraints: MediaStreamConstraints = {
 				video: {
 					facingMode: { ideal: "environment" },
-					...(this.isIOS
-						? {} // iOS picks its own resolution — don't hint
-						: { width: { ideal: 1920 }, height: { ideal: 1080 } }),
+					...(this.isIOS ? {} : { width: { ideal: 1920 }, height: { ideal: 1080 } }),
 				},
 			}
-
 			this.stream = await navigator.mediaDevices.getUserMedia(constraints)
 			this.isCameraOpen = true
 		} catch (err: any) {
-			const msg =
+			this.cameraError =
 				err?.name === "NotAllowedError"
 					? "Camera access denied. Please allow camera access in your browser settings and try again."
 					: err?.name === "NotFoundError"
 						? "No camera found on this device."
 						: `Could not start camera: ${err?.message ?? "unknown error"}`
-			this.cameraError = msg
 		}
 	}
 
 	@action setupVideoElement(videoEl: HTMLVideoElement) {
 		this.videoElement = videoEl
-
 		if (!this.stream) return
 
-		// On iOS, these MUST be set as both attributes AND properties.
-		// The HBS attributes alone are sometimes ignored before srcObject is set.
 		videoEl.setAttribute("autoplay", "")
 		videoEl.setAttribute("muted", "")
-		videoEl.setAttribute("playsinline", "") // prevents iOS fullscreen takeover
-		videoEl.muted = true      // property needed alongside attribute for iOS
+		videoEl.setAttribute("playsinline", "")
+		videoEl.muted = true
 		videoEl.playsInline = true
-
 		videoEl.srcObject = this.stream
 
-		// iOS requires play() to be called after metadata loads.
-		// It also must originate (indirectly) from a user gesture — openCamera()
-		// is called from a button click, so this chain is safe.
 		videoEl.addEventListener(
 			"loadedmetadata",
-			() => {
-				videoEl.play().catch((e) => {
-					console.warn("video.play() failed:", e)
-				})
-			},
+			() => { videoEl.play().catch((e) => console.warn("video.play() failed:", e)) },
 			{ once: true },
 		)
-	}
-
-	/**
-	 * Pre-processes a canvas frame before passing it to jscanify's highlightPaper.
-	 *
-	 * iPhone's True Tone / auto white balance washes out warm-coloured borders
-	 * (yellow, cream, light grey) making them near-invisible to OpenCV's edge
-	 * detector. This method boosts saturation and contrast on a cheap off-screen
-	 * canvas so the border produces strong edges, without altering the live
-	 * preview the user sees.
-	 *
-	 * Only applied on iOS — Android detection works fine with the raw frame.
-	 */
-	private preprocessFrameForDetection(source: HTMLCanvasElement): HTMLCanvasElement {
-		if (!this.isIOS) return source
-
-		const w = source.width
-		const h = source.height
-		const tmp = document.createElement("canvas")
-		tmp.width = w
-		tmp.height = h
-		const ctx = tmp.getContext("2d", { willReadFrequently: true })
-		if (!ctx) return source
-
-		ctx.drawImage(source, 0, 0)
-
-		let imageData: ImageData
-		try {
-			imageData = ctx.getImageData(0, 0, w, h)
-		} catch {
-			return source // tainted canvas — skip
-		}
-
-		const data = imageData.data
-
-		// Boost saturation (1.0 = no change, 2.5 = vivid) and contrast so that
-		// even a faint yellow border becomes a crisp edge for OpenCV to find.
-		const SATURATION = 2.5
-		const CONTRAST   = 1.6
-		const BRIGHTNESS = 10 // slight lift so mid-tones don't go too dark
-
-		for (let i = 0; i < data.length; i += 4) {
-			let r = data[i]     ?? 0
-			let g = data[i + 1] ?? 0
-			let b = data[i + 2] ?? 0
-
-			// ── Saturation boost in HSL space ──────────────────────────
-			const max = Math.max(r, g, b) / 255
-			const min = Math.min(r, g, b) / 255
-			const l   = (max + min) / 2
-
-			if (max !== min) {
-				const d  = max - min
-				const s  = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-				// Re-apply with boosted saturation
-				const newS = Math.min(s * SATURATION, 1)
-				const q    = l < 0.5 ? l * (1 + newS) : l + newS - l * newS
-				const p    = 2 * l - q
-				const hue  = max === (r / 255)
-					? (g / 255 - b / 255) / d + (g < b ? 6 : 0)
-					: max === (g / 255)
-						? (b / 255 - r / 255) / d + 2
-						: (r / 255 - g / 255) / d + 4
-
-				const h6 = hue / 6
-				const hue2rgb = (p2: number, q2: number, t: number): number => {
-					const tt = ((t % 1) + 1) % 1
-					if (tt < 1 / 6) return p2 + (q2 - p2) * 6 * tt
-					if (tt < 1 / 2) return q2
-					if (tt < 2 / 3) return p2 + (q2 - p2) * (2 / 3 - tt) * 6
-					return p2
-				}
-				r = Math.round(hue2rgb(p, q, h6 + 1 / 3) * 255)
-				g = Math.round(hue2rgb(p, q, h6) * 255)
-				b = Math.round(hue2rgb(p, q, h6 - 1 / 3) * 255)
-			}
-
-			// ── Contrast + brightness ───────────────────────────────────
-			r = Math.max(0, Math.min(255, (r - 128) * CONTRAST + 128 + BRIGHTNESS))
-			g = Math.max(0, Math.min(255, (g - 128) * CONTRAST + 128 + BRIGHTNESS))
-			b = Math.max(0, Math.min(255, (b - 128) * CONTRAST + 128 + BRIGHTNESS))
-
-			data[i]     = r
-			data[i + 1] = g
-			data[i + 2] = b
-		}
-
-		ctx.putImageData(imageData, 0, 0)
-		return tmp
 	}
 
 	@action setupHighlightCanvas(canvas: HTMLCanvasElement) {
 		this.highlightCanvas = canvas
 
-		// willReadFrequently tells Safari to keep the canvas in CPU memory,
-		// avoiding expensive GPU readbacks on every getImageData call.
 		const ctx = canvas.getContext("2d", { willReadFrequently: true })
 		if (!ctx) return
 
@@ -277,8 +154,6 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			const video = this.videoElement
 			if (!video) return
 
-			// 150ms (~6fps) is more reliable on iOS than 100ms —
-			// Safari throttles background/low-power tabs aggressively.
 			this.highlightInterval = setInterval(() => {
 				if (!video.videoWidth || !video.videoHeight) return
 
@@ -288,32 +163,22 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				try {
 					ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 				} catch {
-					// drawImage throws if video isn't ready — skip frame
 					return
 				}
 
 				if (this.scanner) {
 					try {
-						// On iOS, pre-process to boost colour edges before detection.
-						// The result is only used for jscanify — the canvas shown to
-						// the user still receives the original highlighted outline drawn
-						// back over it, so the preview never looks over-saturated.
-						const frameForDetection = this.preprocessFrameForDetection(canvas)
-						const highlighted = this.scanner.highlightPaper(frameForDetection)
+						const highlighted = this.scanner.highlightPaper(canvas)
 						ctx.clearRect(0, 0, canvas.width, canvas.height)
-						// Draw the original video frame first (natural colours for user)
 						ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-						// Then draw only the highlight overlay from jscanify on top
 						ctx.drawImage(highlighted, 0, 0)
 					} catch {
-						// No document detected — show raw frame, that's fine
+						// No document detected — show raw frame
 					}
 				}
 			}, 150)
 		}
 
-		// The video element may not yet be set when the canvas inserts into DOM.
-		// Poll briefly, then fall back to the `playing` event.
 		const waitForVideo = () => {
 			const video = this.videoElement
 			if (video && video.readyState >= 2) {
@@ -350,13 +215,10 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					MobileScannerComponent.A4_H,
 				)
 			} else {
-				// Fallback: copy current frame to a fresh canvas
 				scanned = document.createElement("canvas")
 				scanned.width = canvas.width
 				scanned.height = canvas.height
-				scanned
-					.getContext("2d", { willReadFrequently: true })
-					?.drawImage(canvas, 0, 0)
+				scanned.getContext("2d", { willReadFrequently: true })?.drawImage(canvas, 0, 0)
 			}
 
 			const enhanced = this.enhanceImage(scanned)
@@ -367,13 +229,11 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		} catch (_e) {
 			console.error("Capture error:", _e)
 			try {
-				// Last-resort: raw frame
 				this.capturedImages = [
 					...this.capturedImages,
 					canvas.toDataURL("image/jpeg", 0.7),
 				]
 			} catch {
-				// Canvas may be tainted (cross-origin) — tell the user
 				this.cameraError = "Could not capture image. Please try again."
 			}
 		} finally {
@@ -403,7 +263,6 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			})
 
 			const img = new Image()
-			// crossOrigin must be set before src on iOS
 			img.crossOrigin = "anonymous"
 			await new Promise<void>((resolve, reject) => {
 				img.onload = () => resolve()
@@ -425,9 +284,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				const fallback = document.createElement("canvas")
 				fallback.width = img.naturalWidth || img.width
 				fallback.height = img.naturalHeight || img.height
-				fallback
-					.getContext("2d", { willReadFrequently: true })!
-					.drawImage(img, 0, 0)
+				fallback.getContext("2d", { willReadFrequently: true })!.drawImage(img, 0, 0)
 				scanned = fallback
 			}
 
@@ -440,9 +297,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			console.error("Failed to process file:", _e)
 		} finally {
 			this.isProcessingImage = false
-			const input = document.getElementById(
-				"scanner-file-input",
-			) as HTMLInputElement
+			const input = document.getElementById("scanner-file-input") as HTMLInputElement
 			if (input) input.value = ""
 		}
 	}
@@ -468,18 +323,29 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	}
 
 	// ── Image enhancement ──────────────────────────────────────────────
+	//
+	// Goal: make scanned documents look like a professional flatbed scan —
+	// paper is clean white, text is dark and crisp, NO yellow cast.
+	//
+	// The previous version (CONTRAST=1.8, WHITE_CLAMP=240) was too aggressive.
+	// It normalised so hard that warm paper tones were pushed into yellow
+	// and light grey text became invisible.
+	//
+	// New approach — two gentle passes:
+	//
+	// Pass 1 — Adaptive background normalisation (tiles):
+	//   Estimate the paper brightness locally so that uneven lighting
+	//   (shadows on one side, bright window on the other) is corrected.
+	//   We use the 85th-percentile luminance per tile (was 90th) — slightly
+	//   less aggressive so we don't over-whiten coloured paper.
+	//
+	// Pass 2 — Desaturate near-white pixels only:
+	//   After normalisation, paper that should be white sometimes has a
+	//   warm/yellow tint from the camera's white balance. We identify pixels
+	//   that are "nearly white" (luminance > 200 after normalisation) and
+	//   gently pull their saturation toward zero. This removes the yellow cast
+	//   from the paper while leaving text and coloured content completely alone.
 
-	/**
-	 * Adaptive threshold enhancement.
-	 *
-	 * 1. Estimates local background brightness per tile (90th percentile).
-	 * 2. Bilinearly interpolates to produce a smooth background map.
-	 * 3. Normalises each pixel against its local background → paper → white.
-	 * 4. Contrast stretch + white-point clamp → ink stays dark, paper goes pure white.
-	 *
-	 * All canvas operations are wrapped in try/catch — iOS throws SecurityError
-	 * if the canvas is tainted by cross-origin content.
-	 */
 	private enhanceImage(canvas: HTMLCanvasElement): HTMLCanvasElement {
 		const out = document.createElement("canvas")
 		out.width = canvas.width
@@ -488,17 +354,12 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		const ctx = out.getContext("2d", { willReadFrequently: true })
 		if (!ctx) return canvas
 
-		try {
-			ctx.drawImage(canvas, 0, 0)
-		} catch {
-			return canvas
-		}
+		try { ctx.drawImage(canvas, 0, 0) } catch { return canvas }
 
 		let imageData: ImageData
 		try {
 			imageData = ctx.getImageData(0, 0, out.width, out.height)
 		} catch {
-			// SecurityError — canvas is tainted on iOS
 			return canvas
 		}
 
@@ -506,16 +367,17 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		const w = out.width
 		const h = out.height
 
-		// Greyscale luminance map
+		// ── Build greyscale luminance map ──────────────────────────────
 		const grey = new Float32Array(w * h)
 		for (let i = 0; i < w * h; i++) {
-			const r = data[i * 4] ?? 0
-			const g = data[i * 4 + 1] ?? 0
-			const b = data[i * 4 + 2] ?? 0
-			grey[i] = 0.299 * r + 0.587 * g + 0.114 * b
+			grey[i] =
+				0.299 * (data[i * 4] ?? 0) +
+				0.587 * (data[i * 4 + 1] ?? 0) +
+				0.114 * (data[i * 4 + 2] ?? 0)
 		}
 
-		// Tile-based background estimation (90th percentile = paper brightness)
+		// ── Tile-based background estimation ──────────────────────────
+		// 85th percentile (not 90th) — less aggressive, avoids over-whitening
 		const TILES = 8
 		const tileW = Math.ceil(w / TILES)
 		const tileH = Math.ceil(h / TILES)
@@ -527,22 +389,27 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				const y0 = Math.min(ty * tileH, h - 1)
 				const x1 = Math.min(x0 + tileW, w)
 				const y1 = Math.min(y0 + tileH, h)
-
 				const samples: number[] = []
-				for (let y = y0; y < y1; y++) {
-					for (let x = x0; x < x1; x++) {
+				for (let y = y0; y < y1; y++)
+					for (let x = x0; x < x1; x++)
 						samples.push(grey[y * w + x] ?? 0)
-					}
-				}
 				samples.sort((a, b) => a - b)
-				const p90idx = Math.floor(samples.length * 0.9)
-				bg[ty * (TILES + 1) + tx] = samples[p90idx] ?? 255
+				// 85th percentile — gentler than before
+				bg[ty * (TILES + 1) + tx] = samples[Math.floor(samples.length * 0.85)] ?? 255
 			}
 		}
 
-		// Per-pixel: normalise → contrast → clamp
-		const CONTRAST = 1.8
-		const WHITE_CLAMP = 240
+		// ── Per-pixel: normalise + gentle contrast + desaturate near-whites ──
+		//
+		// CONTRAST = 1.3  (was 1.8 — much gentler, preserves natural tones)
+		// WHITE_CLAMP = 245 (was 240 — only force truly near-white pixels to white)
+		// DESAT_THRESHOLD = 210 — pixels brighter than this get desaturated toward grey
+		// DESAT_STRENGTH = 0.75 — how strongly to pull toward grey (0=none, 1=full grey)
+
+		const CONTRAST = 1.3
+		const WHITE_CLAMP = 245
+		const DESAT_THRESHOLD = 210
+		const DESAT_STRENGTH = 0.75
 
 		for (let y = 0; y < h; y++) {
 			const ty = y / tileH
@@ -556,6 +423,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				const tx1 = Math.min(tx0 + 1, TILES)
 				const fx = tx - tx0
 
+				// Bilinear interpolation of background brightness
 				const b00 = bg[ty0 * (TILES + 1) + tx0] ?? 255
 				const b10 = bg[ty0 * (TILES + 1) + tx1] ?? 255
 				const b01 = bg[ty1 * (TILES + 1) + tx0] ?? 255
@@ -567,13 +435,43 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					b11 * fx * fy
 
 				const idx = (y * w + x) * 4
-				for (let c = 0; c < 3; c++) {
-					const raw = data[idx + c] ?? 0
-					let norm = (raw / Math.max(bgVal, 1)) * 255
-					norm = (norm - 128) * CONTRAST + 128
-					if (norm > WHITE_CLAMP) norm = 255
-					data[idx + c] = Math.max(0, Math.min(255, Math.round(norm)))
+				let r = data[idx] ?? 0
+				let g = data[idx + 1] ?? 0
+				let b = data[idx + 2] ?? 0
+
+				// Normalise each channel against local background
+				const scale = 255 / Math.max(bgVal, 1)
+				r = r * scale
+				g = g * scale
+				b = b * scale
+
+				// Gentle contrast stretch
+				r = (r - 128) * CONTRAST + 128
+				g = (g - 128) * CONTRAST + 128
+				b = (b - 128) * CONTRAST + 128
+
+				// Clamp to 0-255
+				r = Math.max(0, Math.min(255, r))
+				g = Math.max(0, Math.min(255, g))
+				b = Math.max(0, Math.min(255, b))
+
+				// Force near-white pixels to pure white
+				if (r > WHITE_CLAMP && g > WHITE_CLAMP && b > WHITE_CLAMP) {
+					r = 255; g = 255; b = 255
+				} else {
+					// Desaturate near-white pixels to remove yellow camera cast.
+					// Only applies to bright pixels — dark text is untouched.
+					const lum = 0.299 * r + 0.587 * g + 0.114 * b
+					if (lum > DESAT_THRESHOLD) {
+						r = r + (lum - r) * DESAT_STRENGTH
+						g = g + (lum - g) * DESAT_STRENGTH
+						b = b + (lum - b) * DESAT_STRENGTH
+					}
 				}
+
+				data[idx]     = Math.round(r)
+				data[idx + 1] = Math.round(g)
+				data[idx + 2] = Math.round(b)
 			}
 		}
 
@@ -585,14 +483,9 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	private loadJsPDF(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			// biome-ignore lint/suspicious/noExplicitAny: jsPDF loaded from CDN
-			if ((window as any).jspdf) {
-				resolve()
-				return
-			}
+			if ((window as any).jspdf) { resolve(); return }
 			const script = document.createElement("script")
-			script.src =
-				"https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+			script.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
 			script.onload = () => resolve()
 			script.onerror = () => reject(new Error("Failed to load jsPDF"))
 			document.head.appendChild(script)
@@ -604,13 +497,8 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		this.isGenerating = true
 		try {
 			await this.loadJsPDF()
-			// biome-ignore lint/suspicious/noExplicitAny: jsPDF loaded from CDN
 			const { jsPDF } = (window as any).jspdf
-			const pdf = new jsPDF({
-				orientation: "portrait",
-				unit: "mm",
-				format: "a4",
-			})
+			const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" })
 			const pageWidth = pdf.internal.pageSize.getWidth()
 			const pageHeight = pdf.internal.pageSize.getHeight()
 
@@ -620,9 +508,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			}
 
 			const blob = pdf.output("blob")
-			const file = new File([blob], `scan-${Date.now()}.pdf`, {
-				type: "application/pdf",
-			})
+			const file = new File([blob], `scan-${Date.now()}.pdf`, { type: "application/pdf" })
 			this.args.onScan(file)
 		} catch (e) {
 			console.error("Failed to generate PDF:", e)
