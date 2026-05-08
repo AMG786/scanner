@@ -154,15 +154,29 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			const video = this.videoElement
 			if (!video) return
 
-			this.highlightInterval = setInterval(() => {
-				if (!video.videoWidth || !video.videoHeight) return
+			// Small off-screen canvas used ONLY for jscanify detection.
+			// Running detection on 320px wide instead of full screen is ~10x faster
+			// because jscanify/OpenCV work on pixel count — fewer pixels = faster Canny.
+			const DETECT_W = 320
+			const detectCanvas = document.createElement("canvas")
+			detectCanvas.width = DETECT_W
+			const detectCtx = detectCanvas.getContext("2d", { willReadFrequently: true })!
 
-				// Draw at screen size, not raw camera resolution (e.g. 1920×1080).
-				// This keeps the preview fitting the phone screen without overflow.
+			// Use requestAnimationFrame for the video draw (smooth, synced to display)
+			// and a separate slower interval just for the jscanify detection pass.
+			let lastHighlight: HTMLCanvasElement | null = null
+			let detectionRunning = false
+
+			const drawFrame = () => {
+				if (!this.highlightInterval) return // stopped
+				if (!video.videoWidth || !video.videoHeight) {
+					requestAnimationFrame(drawFrame)
+					return
+				}
+
+				// Fit canvas to screen width, preserve aspect ratio
 				const displayW = canvas.clientWidth || window.innerWidth
-				const displayH = canvas.clientHeight || window.innerHeight
 				const aspect = video.videoWidth / video.videoHeight
-
 				const drawW = displayW
 				const drawH = Math.round(displayW / aspect)
 
@@ -170,22 +184,49 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				if (canvas.height !== drawH) canvas.height = drawH
 
 				try {
+					// 1. Draw live video frame
 					ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-				} catch {
-					return
-				}
-
-				if (this.scanner) {
-					try {
-						const highlighted = this.scanner.highlightPaper(canvas)
-						ctx.clearRect(0, 0, canvas.width, canvas.height)
-						ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-						ctx.drawImage(highlighted, 0, 0)
-					} catch {
-						// No document detected — show raw frame
+					// 2. Overlay the last computed highlight on top (if any)
+					if (lastHighlight) {
+						ctx.drawImage(lastHighlight, 0, 0, canvas.width, canvas.height)
 					}
+				} catch { /* video not ready */ }
+
+				requestAnimationFrame(drawFrame)
+			}
+
+			// Detection runs on a slower tick — 80ms (~12fps) is plenty for border tracking
+			// and cheap because we run jscanify on the tiny 320px canvas, not the full one.
+			const runDetection = () => {
+				if (!this.scanner || detectionRunning) return
+				if (!video.videoWidth || !video.videoHeight) return
+
+				detectionRunning = true
+				try {
+					// Scale detect canvas to match video aspect
+					const aspect = video.videoWidth / video.videoHeight
+					detectCanvas.height = Math.round(DETECT_W / aspect)
+
+					// Draw tiny version of the current video frame
+					detectCtx.drawImage(video, 0, 0, DETECT_W, detectCanvas.height)
+
+					// Run jscanify on the tiny canvas — fast
+					const highlighted = this.scanner.highlightPaper(detectCanvas)
+
+					// Store for the rAF loop to overlay (it scales it back up via drawImage)
+					lastHighlight = highlighted
+				} catch {
+					// No document in frame — clear the highlight so stale outline disappears
+					lastHighlight = null
+				} finally {
+					detectionRunning = false
 				}
-			}, 150)
+			}
+
+			// Kick off both loops
+			requestAnimationFrame(drawFrame)
+			// Store interval ID so stopCamera() can clear it
+			this.highlightInterval = setInterval(runDetection, 80) as any
 		}
 
 		const waitForVideo = () => {
