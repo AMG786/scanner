@@ -177,19 +177,32 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	}
 
 	/**
-	 * Pre-processes a canvas frame before passing it to jscanify's highlightPaper.
+	 * Pre-processes a canvas frame so jscanify can detect borders on iPhone.
 	 *
-	 * iPhone's True Tone / auto white balance washes out warm-coloured borders
-	 * (yellow, cream, light grey) making them near-invisible to OpenCV's edge
-	 * detector. This method boosts saturation and contrast on a cheap off-screen
-	 * canvas so the border produces strong edges, without altering the live
-	 * preview the user sees.
+	 * ROOT CAUSE: jscanify passes the canvas through cv.cvtColor(RGBA→GREY)
+	 * internally before running Canny edge detection. It never looks at colour.
+	 * iPhone's True Tone auto-WB maps a yellow border (~R:240 G:220 B:160) to a
+	 * near-white grey (~220/255) against white paper (~245/255) — only 25 levels
+	 * of separation. Android cameras render the same border at ~180/255 against
+	 * ~245/255 — 65 levels of separation. Canny's default thresholds in jscanify
+	 * (75 / 200) easily catch the Android edge but miss the iPhone one.
 	 *
-	 * Only applied on iOS — Android detection works fine with the raw frame.
+	 * FIX: Before handing the frame to jscanify, compute a custom luminance that
+	 * weights the Red channel heavily (×2) and subtracts Blue. This maps:
+	 *   - yellow/warm pixels  → bright (high value, blends with paper) … wait,
+	 *     we want the OPPOSITE. We want warm pixels DARK so the edge is sharp.
+	 *
+	 * Actually we invert: weight Blue heavily so warm yellow pixels go DARK and
+	 * cool/white paper pixels stay LIGHT. That maximises the luminance gap at the
+	 * yellow-paper boundary, giving Canny a strong gradient to find.
+	 *
+	 * Formula: L = clamp(1.5×B - 0.5×R)   (boosts blue-white paper, darkens yellow)
+	 * Then apply aggressive contrast stretch so the gap fills the full 0-255 range.
+	 *
+	 * The result is only used for detection — the user always sees the natural
+	 * video frame with the highlight overlay drawn on top.
 	 */
 	private preprocessFrameForDetection(source: HTMLCanvasElement): HTMLCanvasElement {
-		if (!this.isIOS) return source
-
 		const w = source.width
 		const h = source.height
 		const tmp = document.createElement("canvas")
@@ -204,61 +217,37 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		try {
 			imageData = ctx.getImageData(0, 0, w, h)
 		} catch {
-			return source // tainted canvas — skip
+			return source
 		}
 
 		const data = imageData.data
 
-		// Boost saturation (1.0 = no change, 2.5 = vivid) and contrast so that
-		// even a faint yellow border becomes a crisp edge for OpenCV to find.
-		const SATURATION = 2.5
-		const CONTRAST   = 1.6
-		const BRIGHTNESS = 10 // slight lift so mid-tones don't go too dark
+		// Pass 1: compute blue-biased luminance and find min/max for contrast stretch
+		const lum = new Uint8Array(w * h)
+		let lumMin = 255
+		let lumMax = 0
 
-		for (let i = 0; i < data.length; i += 4) {
-			let r = data[i]     ?? 0
-			let g = data[i + 1] ?? 0
-			let b = data[i + 2] ?? 0
+		for (let i = 0; i < w * h; i++) {
+			const r = data[i * 4]     ?? 0
+			const g = data[i * 4 + 1] ?? 0
+			const b = data[i * 4 + 2] ?? 0
+			// Blue-biased: white paper (high B) stays bright, warm yellow (low B, high R) goes dark
+			const v = Math.max(0, Math.min(255, Math.round(0.1 * r + 0.3 * g + 1.6 * b - 50)))
+			lum[i] = v
+			if (v < lumMin) lumMin = v
+			if (v > lumMax) lumMax = v
+		}
 
-			// ── Saturation boost in HSL space ──────────────────────────
-			const max = Math.max(r, g, b) / 255
-			const min = Math.min(r, g, b) / 255
-			const l   = (max + min) / 2
-
-			if (max !== min) {
-				const d  = max - min
-				const s  = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-				// Re-apply with boosted saturation
-				const newS = Math.min(s * SATURATION, 1)
-				const q    = l < 0.5 ? l * (1 + newS) : l + newS - l * newS
-				const p    = 2 * l - q
-				const hue  = max === (r / 255)
-					? (g / 255 - b / 255) / d + (g < b ? 6 : 0)
-					: max === (g / 255)
-						? (b / 255 - r / 255) / d + 2
-						: (r / 255 - g / 255) / d + 4
-
-				const h6 = hue / 6
-				const hue2rgb = (p2: number, q2: number, t: number): number => {
-					const tt = ((t % 1) + 1) % 1
-					if (tt < 1 / 6) return p2 + (q2 - p2) * 6 * tt
-					if (tt < 1 / 2) return q2
-					if (tt < 2 / 3) return p2 + (q2 - p2) * (2 / 3 - tt) * 6
-					return p2
-				}
-				r = Math.round(hue2rgb(p, q, h6 + 1 / 3) * 255)
-				g = Math.round(hue2rgb(p, q, h6) * 255)
-				b = Math.round(hue2rgb(p, q, h6 - 1 / 3) * 255)
-			}
-
-			// ── Contrast + brightness ───────────────────────────────────
-			r = Math.max(0, Math.min(255, (r - 128) * CONTRAST + 128 + BRIGHTNESS))
-			g = Math.max(0, Math.min(255, (g - 128) * CONTRAST + 128 + BRIGHTNESS))
-			b = Math.max(0, Math.min(255, (b - 128) * CONTRAST + 128 + BRIGHTNESS))
-
-			data[i]     = r
-			data[i + 1] = g
-			data[i + 2] = b
+		// Pass 2: contrast-stretch luminance to 0–255 and write back as greyscale RGB
+		// This is exactly what OpenCV would see after its internal RGBA→GREY conversion,
+		// but now with a huge gradient at the document border edge.
+		const range = lumMax - lumMin || 1
+		for (let i = 0; i < w * h; i++) {
+			const stretched = Math.round(((lum[i]! - lumMin) / range) * 255)
+			data[i * 4]     = stretched
+			data[i * 4 + 1] = stretched
+			data[i * 4 + 2] = stretched
+			// alpha unchanged
 		}
 
 		ctx.putImageData(imageData, 0, 0)
@@ -344,11 +333,27 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			let scanned: HTMLCanvasElement
 
 			if (this.scanner && this.libsReady) {
+				// Step 1: use the preprocessed (high-contrast greyscale) frame so
+				// jscanify can reliably find the document corners on iPhone.
+				const frameForDetect = this.preprocessFrameForDetection(canvas)
 				scanned = this.scanner.extractPaper(
-					canvas,
+					frameForDetect,
 					MobileScannerComponent.A4_W,
 					MobileScannerComponent.A4_H,
 				)
+
+				// Step 2: now that we know extraction works, re-run it on the raw
+				// colour frame so the saved image has natural colours (not greyscale).
+				// If it throws (shouldn't — corners are the same) keep the greyscale.
+				try {
+					scanned = this.scanner.extractPaper(
+						canvas,
+						MobileScannerComponent.A4_W,
+						MobileScannerComponent.A4_H,
+					)
+				} catch {
+					// keep greyscale scanned — at least it's correctly cropped
+				}
 			} else {
 				// Fallback: copy current frame to a fresh canvas
 				scanned = document.createElement("canvas")
