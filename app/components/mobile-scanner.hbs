@@ -1,10 +1,10 @@
 {{! Full-screen scanner overlay }}
 <div class="fixed inset-0 z-50 bg-black flex flex-col">
 
-	{{! ── STATE 1: CAMERA VIEW ────────────────────────────────────────── }}
 	{{#if this.isCameraOpen}}
+		{{! Camera view }}
 		<div class="relative flex-1 overflow-hidden">
-			{{! Hidden video — provides the MediaStream }}
+			{{! Hidden video provides the MediaStream — not shown directly }}
 			<video
 				id="scanner-video"
 				autoplay
@@ -13,14 +13,14 @@
 				class="hidden absolute"
 				{{did-insert this.setupVideoElement}}
 			/>
-			{{! Canvas shows live video feed }}
+			{{! Canvas shows live video frames + jscanify document outline highlight }}
 			<canvas
-				id="scanner-canvas"
+				id="scanner-highlight"
 				class="w-full h-full object-cover"
-				{{did-insert this.setupLiveCanvas}}
+				{{did-insert this.setupHighlightCanvas}}
 			/>
 
-			{{! Bottom controls }}
+			{{! Capture controls }}
 			<div class="absolute bottom-0 inset-x-0 pb-10 flex justify-around items-center bg-gradient-to-t from-black/60 to-transparent pt-12">
 				<button
 					type="button"
@@ -34,74 +34,28 @@
 				<button
 					type="button"
 					aria-label="Capture photo"
-					class="w-18 h-18 rounded-full border-4 border-white bg-white/20 flex items-center justify-center cursor-pointer active:scale-95 transition-transform"
+					class="
+						w-18 h-18 rounded-full
+						border-4 border-white
+						bg-white/20
+						flex items-center justify-center
+						cursor-pointer
+						active:scale-95 transition-transform
+					"
 					{{on "click" this.capturePhoto}}
 				>
 					<div class="w-14 h-14 bg-white rounded-full" />
 				</button>
 
-				<div class="w-16" />
+				<div class="w-16" />{{! spacer to centre shutter button }}
 			</div>
 		</div>
 
-	{{! ── STATE 2: CROP VIEW ──────────────────────────────────────────── }}
-	{{else if this.cropImageUrl}}
-		<div class="flex flex-col h-full bg-gray-950">
-			{{! Header }}
-			<div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white shrink-0">
-				<button
-					type="button"
-					class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
-					{{on "click" this.retakePhoto}}
-				>
-					<i class="ri-arrow-left-line mr-1" />Retake
-				</button>
-				<div class="text-sm font-semibold text-gray-300">Adjust crop</div>
-				<button
-					type="button"
-					class="text-sm uppercase tracking-wide cursor-pointer text-white font-semibold"
-					{{on "click" this.confirmCrop}}
-				>
-					Use Page
-				</button>
-			</div>
-
-			{{! Cropper area — flex-1 so it fills available space }}
-			<div class="flex-1 overflow-hidden flex items-center justify-center bg-gray-950">
-				<ImageCropper
-					@source={{this.cropImageUrl}}
-					@options={{hash
-						viewMode=1
-						dragMode="move"
-						aspectRatio=0
-						autoCropArea=0.95
-						responsive=true
-						restore=false
-						guides=true
-						center=true
-						highlight=false
-						cropBoxMovable=true
-						cropBoxResizable=true
-						toggleDragModeOnDblclick=false
-					}}
-					as |cropper|
-				>
-					{{! Store the cropper instance when it's ready }}
-					<cropper.on @event="ready" @action={{this.onCropperReady}} />
-				</ImageCropper>
-			</div>
-
-			<div class="px-4 py-3 bg-gray-900 shrink-0 text-center text-xs text-gray-400">
-				Drag to move · Pinch or drag corners to resize
-			</div>
-		</div>
-
-	{{! ── STATE 3: PAGES PREVIEW ──────────────────────────────────────── }}
 	{{else}}
-		<p class="sr-only">Document Scanner</p>
-
+		{{! Preview and controls view }}
+        <p class="sr-only">Document Scanner</p>
 		{{! Header }}
-		<div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white shrink-0">
+		<div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white">
 			<button
 				type="button"
 				class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
@@ -142,7 +96,13 @@
 						<button
 							type="button"
 							aria-label="Remove page {{item.pageNumber}}"
-							class="absolute top-1 right-1 w-6 h-6 rounded-full bg-red-600 text-white text-xs flex items-center justify-center cursor-pointer"
+							class="
+								absolute top-1 right-1
+								w-6 h-6 rounded-full
+								bg-red-600 text-white text-xs
+								flex items-center justify-center
+								cursor-pointer
+							"
 							{{on "click" (fn this.removePage item.index)}}
 						>
 							<i class="ri-close-line" />
@@ -155,10 +115,16 @@
 			</div>
 
 			{{! Upload button }}
-			<div class="p-4 bg-gray-900 shrink-0">
+			<div class="p-4 bg-gray-900">
 				<button
 					type="button"
-					class="w-full bg-white text-black py-4 rounded-lg font-semibold uppercase tracking-wide cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+					class="
+						w-full bg-white text-black
+						py-4 rounded-lg
+						font-semibold uppercase tracking-wide
+						cursor-pointer
+						disabled:opacity-50 disabled:cursor-not-allowed
+					"
 					disabled={{this.isGenerating}}
 					{{on "click" this.generatePDF}}
 				>
@@ -175,7 +141,7 @@
 			</div>
 
 		{{else}}
-			{{! Empty state }}
+			{{! Empty state - no pages yet }}
 			<div class="flex-1 flex flex-col justify-center items-center gap-6 text-white bg-gray-950">
 				<i class="ri-file-scan-line text-6xl text-gray-500" />
 				<div class="text-center">
@@ -190,6 +156,7 @@
 				{{/if}}
 
 				<div class="flex gap-3">
+					{{! Open camera }}
 					<button
 						type="button"
 						class="bg-white text-black px-8 py-3 rounded-full font-semibold cursor-pointer"
@@ -198,7 +165,7 @@
 						<i class="ri-camera-line mr-2" />Start Scanning
 					</button>
 
-					{{! Load from file — desktop testing }}
+					{{! Load from file - for desktop testing }}
 					<button
 						type="button"
 						class="bg-gray-700 text-white px-8 py-3 rounded-full font-semibold cursor-pointer"
@@ -208,6 +175,7 @@
 					</button>
 				</div>
 
+				{{! Hidden file input triggered by loadFromFile button }}
 				<input
 					type="file"
 					accept="image/*"
