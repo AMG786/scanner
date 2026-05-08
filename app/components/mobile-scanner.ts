@@ -25,6 +25,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	private scanner: any = null
 	private highlightInterval: ReturnType<typeof setInterval> | null = null
 	private highlightCanvas: HTMLCanvasElement | null = null
+	private videoElement: HTMLVideoElement | null = null
 
 	get capturedImagesWithIndex() {
 		return this.capturedImages.map((url, index) => ({
@@ -36,6 +37,16 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	get isAtPageLimit() {
 		return this.capturedImages.length >= MobileScannerComponent.MAX_PAGES
+	}
+
+	// ── iOS detection ──────────────────────────────────────────────────
+
+	private get isIOS(): boolean {
+		return (
+			/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+			// iPad OS 13+ reports as MacIntel with touch support
+			(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+		)
 	}
 
 	// ── Library loading ────────────────────────────────────────────────
@@ -55,14 +66,23 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	}
 
 	private waitForOpenCV(): Promise<void> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
+			// iOS Safari has stricter Wasm init time — give it 15s
+			const timeout = setTimeout(() => {
+				reject(new Error("OpenCV timed out"))
+			}, 15000)
+
 			const check = () => {
 				// biome-ignore lint/suspicious/noExplicitAny: opencv global
 				const cv = (window as any).cv
 				if (cv && cv.Mat) {
+					clearTimeout(timeout)
 					resolve()
-				} else if (cv) {
-					cv.onRuntimeInitialized = resolve
+				} else if (cv && cv.onRuntimeInitialized !== undefined) {
+					cv.onRuntimeInitialized = () => {
+						clearTimeout(timeout)
+						resolve()
+					}
 				} else {
 					setTimeout(check, 100)
 				}
@@ -73,6 +93,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	private async loadScannerLibs(): Promise<void> {
 		if (this.libsReady) return
+		if (this.libsLoading) return
 		this.libsLoading = true
 		try {
 			await this.loadScript("https://docs.opencv.org/4.x/opencv.js")
@@ -85,52 +106,102 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			this.libsReady = true
 		} catch (e) {
 			console.warn("Scanner libs failed to load, will use raw capture:", e)
+			// Camera still works — just no outline highlight
 		} finally {
 			this.libsLoading = false
 		}
 	}
 
+	// ── Camera ─────────────────────────────────────────────────────────
+
 	@action async openCamera() {
 		if (this.isAtPageLimit) return
 		this.cameraError = null
 
-		// Load scanner libs in background while camera opens
-		this.loadScannerLibs()
+		// Start loading libs in background — don't block camera open
+		this.loadScannerLibs().catch(() => {/* handled inside */})
 
 		try {
-			this.stream = await navigator.mediaDevices.getUserMedia({
-				video: { facingMode: { ideal: "environment" } },
-			})
+			// iOS Safari is strict about constraints.
+			// Use `ideal` (never `exact`) to avoid OverconstrainedError.
+			// Keep it simple on iOS — extra constraints trigger silent failures.
+			const constraints: MediaStreamConstraints = {
+				video: {
+					facingMode: { ideal: "environment" },
+					...(this.isIOS
+						? {} // iOS picks its own resolution — don't hint
+						: { width: { ideal: 1920 }, height: { ideal: 1080 } }),
+				},
+			}
+
+			this.stream = await navigator.mediaDevices.getUserMedia(constraints)
 			this.isCameraOpen = true
-		} catch (_e) {
-			this.cameraError =
-				"Camera access denied. Please allow camera access in your browser settings and try again."
+		} catch (err: any) {
+			const msg =
+				err?.name === "NotAllowedError"
+					? "Camera access denied. Please allow camera access in your browser settings and try again."
+					: err?.name === "NotFoundError"
+						? "No camera found on this device."
+						: `Could not start camera: ${err?.message ?? "unknown error"}`
+			this.cameraError = msg
 		}
 	}
 
 	@action setupVideoElement(videoEl: HTMLVideoElement) {
-		if (this.stream) {
-			videoEl.srcObject = this.stream
-		}
+		this.videoElement = videoEl
+
+		if (!this.stream) return
+
+		// On iOS, these MUST be set as both attributes AND properties.
+		// The HBS attributes alone are sometimes ignored before srcObject is set.
+		videoEl.setAttribute("autoplay", "")
+		videoEl.setAttribute("muted", "")
+		videoEl.setAttribute("playsinline", "") // prevents iOS fullscreen takeover
+		videoEl.muted = true      // property needed alongside attribute for iOS
+		videoEl.playsInline = true
+
+		videoEl.srcObject = this.stream
+
+		// iOS requires play() to be called after metadata loads.
+		// It also must originate (indirectly) from a user gesture — openCamera()
+		// is called from a button click, so this chain is safe.
+		videoEl.addEventListener(
+			"loadedmetadata",
+			() => {
+				videoEl.play().catch((e) => {
+					console.warn("video.play() failed:", e)
+				})
+			},
+			{ once: true },
+		)
 	}
 
-	// Called by did-insert on the highlight canvas element.
-	// Starts a 10fps loop: draw video frame → run jscanify highlightPaper → display result.
 	@action setupHighlightCanvas(canvas: HTMLCanvasElement) {
 		this.highlightCanvas = canvas
-		const video = document.getElementById("scanner-video") as HTMLVideoElement
-		if (!video) return
+
+		// willReadFrequently tells Safari to keep the canvas in CPU memory,
+		// avoiding expensive GPU readbacks on every getImageData call.
+		const ctx = canvas.getContext("2d", { willReadFrequently: true })
+		if (!ctx) return
 
 		const startLoop = () => {
-			const ctx = canvas.getContext("2d")
-			if (!ctx) return
+			const video = this.videoElement
+			if (!video) return
 
+			// 150ms (~6fps) is more reliable on iOS than 100ms —
+			// Safari throttles background/low-power tabs aggressively.
 			this.highlightInterval = setInterval(() => {
 				if (!video.videoWidth || !video.videoHeight) return
+
 				if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
 				if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
 
-				ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+				try {
+					ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+				} catch {
+					// drawImage throws if video isn't ready — skip frame
+					return
+				}
 
 				if (this.scanner) {
 					try {
@@ -138,17 +209,25 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 						ctx.clearRect(0, 0, canvas.width, canvas.height)
 						ctx.drawImage(highlighted, 0, 0)
 					} catch {
-						// Scanner not ready yet or no document detected — show raw frame
+						// No document detected — show raw frame, that's fine
 					}
 				}
-			}, 100)
+			}, 150)
 		}
 
-		if (video.readyState >= 2) {
-			startLoop()
-		} else {
-			video.addEventListener("playing", startLoop, { once: true })
+		// The video element may not yet be set when the canvas inserts into DOM.
+		// Poll briefly, then fall back to the `playing` event.
+		const waitForVideo = () => {
+			const video = this.videoElement
+			if (video && video.readyState >= 2) {
+				startLoop()
+			} else if (video) {
+				video.addEventListener("playing", startLoop, { once: true })
+			} else {
+				setTimeout(waitForVideo, 50)
+			}
 		}
+		waitForVideo()
 	}
 
 	@action async capturePhoto() {
@@ -157,7 +236,6 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		const canvas = this.highlightCanvas
 		if (!canvas) return
 
-		// Stop the highlight loop before we mutate state
 		if (this.highlightInterval !== null) {
 			clearInterval(this.highlightInterval)
 			this.highlightInterval = null
@@ -167,6 +245,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 		try {
 			let scanned: HTMLCanvasElement
+
 			if (this.scanner && this.libsReady) {
 				scanned = this.scanner.extractPaper(
 					canvas,
@@ -174,31 +253,42 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					MobileScannerComponent.A4_H,
 				)
 			} else {
-				scanned = canvas
+				// Fallback: copy current frame to a fresh canvas
+				scanned = document.createElement("canvas")
+				scanned.width = canvas.width
+				scanned.height = canvas.height
+				scanned
+					.getContext("2d", { willReadFrequently: true })
+					?.drawImage(canvas, 0, 0)
 			}
+
 			const enhanced = this.enhanceImage(scanned)
 			this.capturedImages = [
 				...this.capturedImages,
 				enhanced.toDataURL("image/jpeg", 0.85),
 			]
 		} catch (_e) {
-			// Fallback to raw frame on any scan error
-			this.capturedImages = [
-				...this.capturedImages,
-				canvas.toDataURL("image/jpeg", 0.7),
-			]
+			console.error("Capture error:", _e)
+			try {
+				// Last-resort: raw frame
+				this.capturedImages = [
+					...this.capturedImages,
+					canvas.toDataURL("image/jpeg", 0.7),
+				]
+			} catch {
+				// Canvas may be tainted (cross-origin) — tell the user
+				this.cameraError = "Could not capture image. Please try again."
+			}
 		} finally {
 			this.isProcessingImage = false
 			this.stopCamera()
 		}
 	}
 
-	// ── File input (for testing on desktop) ────────────────────────────
+	// ── File input ─────────────────────────────────────────────────────
 
 	@action loadFromFile() {
-		const input = document.getElementById(
-			"scanner-file-input",
-		) as HTMLInputElement
+		const input = document.getElementById("scanner-file-input") as HTMLInputElement
 		if (input) input.click()
 	}
 
@@ -216,14 +306,18 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			})
 
 			const img = new Image()
-			await new Promise<void>((resolve) => {
+			// crossOrigin must be set before src on iOS
+			img.crossOrigin = "anonymous"
+			await new Promise<void>((resolve, reject) => {
 				img.onload = () => resolve()
+				img.onerror = () => reject(new Error("Image load failed"))
 				img.src = dataUrl
 			})
 
 			await this.loadScannerLibs()
 
 			let scanned: HTMLCanvasElement
+
 			if (this.scanner && this.libsReady) {
 				scanned = this.scanner.extractPaper(
 					img,
@@ -232,10 +326,11 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				)
 			} else {
 				const fallback = document.createElement("canvas")
-				fallback.width = img.width
-				fallback.height = img.height
-				// biome-ignore lint/style/noNonNullAssertion: canvas always has 2d context
-				fallback.getContext("2d")!.drawImage(img, 0, 0)
+				fallback.width = img.naturalWidth || img.width
+				fallback.height = img.naturalHeight || img.height
+				fallback
+					.getContext("2d", { willReadFrequently: true })!
+					.drawImage(img, 0, 0)
 				scanned = fallback
 			}
 
@@ -255,12 +350,15 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		}
 	}
 
+	// ── Stop camera ────────────────────────────────────────────────────
+
 	@action stopCamera() {
 		if (this.highlightInterval !== null) {
 			clearInterval(this.highlightInterval)
 			this.highlightInterval = null
 		}
 		this.highlightCanvas = null
+		this.videoElement = null
 		if (this.stream) {
 			this.stream.getTracks().forEach((track) => track.stop())
 			this.stream = null
@@ -275,33 +373,43 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	// ── Image enhancement ──────────────────────────────────────────────
 
 	/**
-	 * Produces a clean, professional "scanned document" look:
+	 * Adaptive threshold enhancement.
 	 *
-	 * 1. Adaptive threshold — estimates the local background brightness across
-	 *    a grid of tiles and normalises each tile independently. This is what
-	 *    makes uneven lighting (stairwell shadows, harsh sunlight on one corner)
-	 *    disappear and turns the paper a uniform white.
+	 * 1. Estimates local background brightness per tile (90th percentile).
+	 * 2. Bilinearly interpolates to produce a smooth background map.
+	 * 3. Normalises each pixel against its local background → paper → white.
+	 * 4. Contrast stretch + white-point clamp → ink stays dark, paper goes pure white.
 	 *
-	 * 2. Contrast stretch — after normalisation the histogram is compressed;
-	 *    a gentle contrast boost re-separates ink from paper.
-	 *
-	 * 3. White-point clamp — pixels above a high threshold are forced to pure
-	 *    white, eliminating residual grey cast on the paper.
+	 * All canvas operations are wrapped in try/catch — iOS throws SecurityError
+	 * if the canvas is tainted by cross-origin content.
 	 */
 	private enhanceImage(canvas: HTMLCanvasElement): HTMLCanvasElement {
 		const out = document.createElement("canvas")
 		out.width = canvas.width
 		out.height = canvas.height
-		const ctx = out.getContext("2d")
+
+		const ctx = out.getContext("2d", { willReadFrequently: true })
 		if (!ctx) return canvas
 
-		ctx.drawImage(canvas, 0, 0)
-		const imageData = ctx.getImageData(0, 0, out.width, out.height)
+		try {
+			ctx.drawImage(canvas, 0, 0)
+		} catch {
+			return canvas
+		}
+
+		let imageData: ImageData
+		try {
+			imageData = ctx.getImageData(0, 0, out.width, out.height)
+		} catch {
+			// SecurityError — canvas is tainted on iOS
+			return canvas
+		}
+
 		const data = imageData.data
 		const w = out.width
 		const h = out.height
 
-		// ── Step 1: convert to greyscale luminance map ──────────────────
+		// Greyscale luminance map
 		const grey = new Float32Array(w * h)
 		for (let i = 0; i < w * h; i++) {
 			const r = data[i * 4] ?? 0
@@ -310,24 +418,19 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			grey[i] = 0.299 * r + 0.587 * g + 0.114 * b
 		}
 
-		// ── Step 2: estimate background via a coarse tile grid ──────────
-		// Each tile's 90th-percentile luminance ≈ background brightness.
-		// We bilinearly interpolate between tile centres to get a smooth
-		// background map — this is the core of adaptive thresholding.
-		const TILES = 8 // 8×8 grid
+		// Tile-based background estimation (90th percentile = paper brightness)
+		const TILES = 8
 		const tileW = Math.ceil(w / TILES)
 		const tileH = Math.ceil(h / TILES)
 		const bg = new Float32Array((TILES + 1) * (TILES + 1))
 
 		for (let ty = 0; ty <= TILES; ty++) {
 			for (let tx = 0; tx <= TILES; tx++) {
-				// Clamp tile bounds to image edges
 				const x0 = Math.min(tx * tileW, w - 1)
 				const y0 = Math.min(ty * tileH, h - 1)
 				const x1 = Math.min(x0 + tileW, w)
 				const y1 = Math.min(y0 + tileH, h)
 
-				// Collect luminance samples in this tile
 				const samples: number[] = []
 				for (let y = y0; y < y1; y++) {
 					for (let x = x0; x < x1; x++) {
@@ -335,30 +438,27 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					}
 				}
 				samples.sort((a, b) => a - b)
-				// 90th percentile ≈ paper brightness in this region
 				const p90idx = Math.floor(samples.length * 0.9)
 				bg[ty * (TILES + 1) + tx] = samples[p90idx] ?? 255
 			}
 		}
 
-		// ── Step 3: apply adaptive normalisation + contrast ─────────────
-		const CONTRAST = 1.8 // increase ink-to-paper separation
-		const WHITE_CLAMP = 240 // pixels brighter than this → pure white
+		// Per-pixel: normalise → contrast → clamp
+		const CONTRAST = 1.8
+		const WHITE_CLAMP = 240
 
 		for (let y = 0; y < h; y++) {
-			// Tile-space y coordinate (fractional)
-			const ty = (y / tileH)
+			const ty = y / tileH
 			const ty0 = Math.floor(ty)
 			const ty1 = Math.min(ty0 + 1, TILES)
 			const fy = ty - ty0
 
 			for (let x = 0; x < w; x++) {
-				const tx = (x / tileW)
+				const tx = x / tileW
 				const tx0 = Math.floor(tx)
 				const tx1 = Math.min(tx0 + 1, TILES)
 				const fx = tx - tx0
 
-				// Bilinear interpolation of background brightness
 				const b00 = bg[ty0 * (TILES + 1) + tx0] ?? 255
 				const b10 = bg[ty0 * (TILES + 1) + tx1] ?? 255
 				const b01 = bg[ty1 * (TILES + 1) + tx0] ?? 255
@@ -370,18 +470,13 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					b11 * fx * fy
 
 				const idx = (y * w + x) * 4
-
 				for (let c = 0; c < 3; c++) {
 					const raw = data[idx + c] ?? 0
-					// Normalise: scale so that bgVal maps to 255 (paper → white)
 					let norm = (raw / Math.max(bgVal, 1)) * 255
-					// Contrast stretch around midpoint
 					norm = (norm - 128) * CONTRAST + 128
-					// White-point clamp: near-white → pure white
 					if (norm > WHITE_CLAMP) norm = 255
 					data[idx + c] = Math.max(0, Math.min(255, Math.round(norm)))
 				}
-				// alpha unchanged
 			}
 		}
 
@@ -390,6 +485,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 	}
 
 	// ── PDF generation ─────────────────────────────────────────────────
+
 	private loadJsPDF(): Promise<void> {
 		return new Promise((resolve, reject) => {
 			// biome-ignore lint/suspicious/noExplicitAny: jsPDF loaded from CDN
@@ -423,14 +519,7 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 			for (let i = 0; i < this.capturedImages.length; i++) {
 				if (i > 0) pdf.addPage()
-				pdf.addImage(
-					this.capturedImages[i],
-					"JPEG",
-					0,
-					0,
-					pageWidth,
-					pageHeight,
-				)
+				pdf.addImage(this.capturedImages[i], "JPEG", 0, 0, pageWidth, pageHeight)
 			}
 
 			const blob = pdf.output("blob")
