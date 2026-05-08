@@ -8,25 +8,28 @@ interface MobileScannerArgs {
 }
 
 export default class MobileScannerComponent extends Component<MobileScannerArgs> {
+	// ── UI state ───────────────────────────────────────────────────────
 	@tracked isCameraOpen = false
+	@tracked cropImageUrl: string | null = null
 	@tracked capturedImages: string[] = []
 	@tracked isGenerating = false
-	@tracked isProcessingImage = false
-	@tracked libsReady = false
-	@tracked libsLoading = false
 	@tracked cameraError: string | null = null
 
 	static MAX_PAGES = 20
-
 	private static A4_W = 794
 	private static A4_H = 1123
 
+	// ── Internal refs ──────────────────────────────────────────────────
 	private stream: MediaStream | null = null
-	private scanner: any = null
-	private highlightInterval: ReturnType<typeof setInterval> | null = null
-	private highlightCanvas: HTMLCanvasElement | null = null
 	private videoElement: HTMLVideoElement | null = null
+	private liveCanvas: HTMLCanvasElement | null = null
+	private liveInterval: ReturnType<typeof setInterval> | null = null
 
+	// Raw Cropper.js instance — loaded from CDN, no addon required
+	// Avoids all @embroider/virtual / strict-mode import issues entirely.
+	private cropperInstance: any = null
+
+	// ── Derived ────────────────────────────────────────────────────────
 	get capturedImagesWithIndex() {
 		return this.capturedImages.map((url, index) => ({
 			url,
@@ -39,77 +42,44 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		return this.capturedImages.length >= MobileScannerComponent.MAX_PAGES
 	}
 
-	// ── iOS detection ──────────────────────────────────────────────────
-
 	private get isIOS(): boolean {
 		return (
 			/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-			// iPad OS 13+ reports as MacIntel with touch support
 			(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
 		)
 	}
 
-	// ── Library loading ────────────────────────────────────────────────
+	// ── Load Cropper.js from CDN ───────────────────────────────────────
+	// We load both the JS and CSS. The CSS is injected once into <head>.
+	// This avoids ember-cropperjs and all its Embroider compatibility issues.
 
-	private loadScript(src: string): Promise<void> {
-		return new Promise((resolve, reject) => {
-			if (document.querySelector(`script[src="${src}"]`)) {
-				resolve()
-				return
-			}
+	private cropperJsLoaded = false
+
+	private async loadCropperJs(): Promise<void> {
+		if (this.cropperJsLoaded || (window as any).Cropper) {
+			this.cropperJsLoaded = true
+			return
+		}
+
+		// Inject Cropper.js CSS if not already present
+		if (!document.querySelector('link[data-cropper-css]')) {
+			const link = document.createElement("link")
+			link.rel = "stylesheet"
+			link.href = "https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css"
+			link.setAttribute("data-cropper-css", "")
+			document.head.appendChild(link)
+		}
+
+		// Load Cropper.js script
+		await new Promise<void>((resolve, reject) => {
 			const script = document.createElement("script")
-			script.src = src
+			script.src = "https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"
 			script.onload = () => resolve()
-			script.onerror = () => reject(new Error(`Failed to load ${src}`))
+			script.onerror = () => reject(new Error("Failed to load Cropper.js"))
 			document.head.appendChild(script)
 		})
-	}
 
-	private waitForOpenCV(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			// iOS Safari has stricter Wasm init time — give it 15s
-			const timeout = setTimeout(() => {
-				reject(new Error("OpenCV timed out"))
-			}, 15000)
-
-			const check = () => {
-				// biome-ignore lint/suspicious/noExplicitAny: opencv global
-				const cv = (window as any).cv
-				if (cv && cv.Mat) {
-					clearTimeout(timeout)
-					resolve()
-				} else if (cv && cv.onRuntimeInitialized !== undefined) {
-					cv.onRuntimeInitialized = () => {
-						clearTimeout(timeout)
-						resolve()
-					}
-				} else {
-					setTimeout(check, 100)
-				}
-			}
-			check()
-		})
-	}
-
-	private async loadScannerLibs(): Promise<void> {
-		if (this.libsReady) return
-		if (this.libsLoading) return
-		this.libsLoading = true
-		try {
-			await this.loadScript("https://docs.opencv.org/4.x/opencv.js")
-			await this.waitForOpenCV()
-			await this.loadScript(
-				"https://cdn.jsdelivr.net/gh/ColonelParrot/jscanify@master/src/jscanify.min.js",
-			)
-			// biome-ignore lint/suspicious/noExplicitAny: jscanify global
-			this.scanner = new (window as any).jscanify()
-			this.libsReady = true
-		} catch (e) {
-			console.warn("Scanner libs failed to load, will use raw capture:", e)
-			// Camera still works — just no outline highlight
-		} finally {
-			this.libsLoading = false
-		}
+		this.cropperJsLoaded = true
 	}
 
 	// ── Camera ─────────────────────────────────────────────────────────
@@ -118,351 +88,201 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		if (this.isAtPageLimit) return
 		this.cameraError = null
 
-		// Start loading libs in background — don't block camera open
-		this.loadScannerLibs().catch(() => {/* handled inside */})
+		// Pre-load Cropper.js in the background while camera opens
+		this.loadCropperJs().catch(() => {})
 
 		try {
-			// iOS Safari is strict about constraints.
-			// Use `ideal` (never `exact`) to avoid OverconstrainedError.
-			// Keep it simple on iOS — extra constraints trigger silent failures.
 			const constraints: MediaStreamConstraints = {
 				video: {
 					facingMode: { ideal: "environment" },
-					...(this.isIOS
-						? {} // iOS picks its own resolution — don't hint
-						: { width: { ideal: 1920 }, height: { ideal: 1080 } }),
+					...(this.isIOS ? {} : { width: { ideal: 1920 }, height: { ideal: 1080 } }),
 				},
 			}
-
 			this.stream = await navigator.mediaDevices.getUserMedia(constraints)
 			this.isCameraOpen = true
 		} catch (err: any) {
-			const msg =
+			this.cameraError =
 				err?.name === "NotAllowedError"
-					? "Camera access denied. Please allow camera access in your browser settings and try again."
+					? "Camera access denied. Please allow camera access in your browser settings."
 					: err?.name === "NotFoundError"
 						? "No camera found on this device."
 						: `Could not start camera: ${err?.message ?? "unknown error"}`
-			this.cameraError = msg
 		}
 	}
 
 	@action setupVideoElement(videoEl: HTMLVideoElement) {
 		this.videoElement = videoEl
-
 		if (!this.stream) return
 
-		// On iOS, these MUST be set as both attributes AND properties.
-		// The HBS attributes alone are sometimes ignored before srcObject is set.
 		videoEl.setAttribute("autoplay", "")
 		videoEl.setAttribute("muted", "")
-		videoEl.setAttribute("playsinline", "") // prevents iOS fullscreen takeover
-		videoEl.muted = true      // property needed alongside attribute for iOS
+		videoEl.setAttribute("playsinline", "")
+		videoEl.muted = true
 		videoEl.playsInline = true
-
 		videoEl.srcObject = this.stream
 
-		// iOS requires play() to be called after metadata loads.
-		// It also must originate (indirectly) from a user gesture — openCamera()
-		// is called from a button click, so this chain is safe.
 		videoEl.addEventListener(
 			"loadedmetadata",
-			() => {
-				videoEl.play().catch((e) => {
-					console.warn("video.play() failed:", e)
-				})
-			},
+			() => { videoEl.play().catch(() => {}) },
 			{ once: true },
 		)
 	}
 
-	/**
-	 * Pre-processes a canvas frame so jscanify can detect borders on iPhone.
-	 *
-	 * ROOT CAUSE: jscanify passes the canvas through cv.cvtColor(RGBA→GREY)
-	 * internally before running Canny edge detection. It never looks at colour.
-	 * iPhone's True Tone auto-WB maps a yellow border (~R:240 G:220 B:160) to a
-	 * near-white grey (~220/255) against white paper (~245/255) — only 25 levels
-	 * of separation. Android cameras render the same border at ~180/255 against
-	 * ~245/255 — 65 levels of separation. Canny's default thresholds in jscanify
-	 * (75 / 200) easily catch the Android edge but miss the iPhone one.
-	 *
-	 * FIX: Before handing the frame to jscanify, compute a custom luminance that
-	 * weights the Red channel heavily (×2) and subtracts Blue. This maps:
-	 *   - yellow/warm pixels  → bright (high value, blends with paper) … wait,
-	 *     we want the OPPOSITE. We want warm pixels DARK so the edge is sharp.
-	 *
-	 * Actually we invert: weight Blue heavily so warm yellow pixels go DARK and
-	 * cool/white paper pixels stay LIGHT. That maximises the luminance gap at the
-	 * yellow-paper boundary, giving Canny a strong gradient to find.
-	 *
-	 * Formula: L = clamp(1.5×B - 0.5×R)   (boosts blue-white paper, darkens yellow)
-	 * Then apply aggressive contrast stretch so the gap fills the full 0-255 range.
-	 *
-	 * The result is only used for detection — the user always sees the natural
-	 * video frame with the highlight overlay drawn on top.
-	 */
-	private preprocessFrameForDetection(source: HTMLCanvasElement): HTMLCanvasElement {
-		const w = source.width
-		const h = source.height
-		const tmp = document.createElement("canvas")
-		tmp.width = w
-		tmp.height = h
-		const ctx = tmp.getContext("2d", { willReadFrequently: true })
-		if (!ctx) return source
-
-		ctx.drawImage(source, 0, 0)
-
-		let imageData: ImageData
-		try {
-			imageData = ctx.getImageData(0, 0, w, h)
-		} catch {
-			return source
-		}
-
-		const data = imageData.data
-
-		// Pass 1: compute blue-biased luminance and find min/max for contrast stretch
-		const lum = new Uint8Array(w * h)
-		let lumMin = 255
-		let lumMax = 0
-
-		for (let i = 0; i < w * h; i++) {
-			const r = data[i * 4]     ?? 0
-			const g = data[i * 4 + 1] ?? 0
-			const b = data[i * 4 + 2] ?? 0
-			// Blue-biased: white paper (high B) stays bright, warm yellow (low B, high R) goes dark
-			const v = Math.max(0, Math.min(255, Math.round(0.1 * r + 0.3 * g + 1.6 * b - 50)))
-			lum[i] = v
-			if (v < lumMin) lumMin = v
-			if (v > lumMax) lumMax = v
-		}
-
-		// Pass 2: contrast-stretch luminance to 0–255 and write back as greyscale RGB
-		// This is exactly what OpenCV would see after its internal RGBA→GREY conversion,
-		// but now with a huge gradient at the document border edge.
-		const range = lumMax - lumMin || 1
-		for (let i = 0; i < w * h; i++) {
-			const stretched = Math.round(((lum[i]! - lumMin) / range) * 255)
-			data[i * 4]     = stretched
-			data[i * 4 + 1] = stretched
-			data[i * 4 + 2] = stretched
-			// alpha unchanged
-		}
-
-		ctx.putImageData(imageData, 0, 0)
-		return tmp
-	}
-
-	@action setupHighlightCanvas(canvas: HTMLCanvasElement) {
-		this.highlightCanvas = canvas
-
-		// willReadFrequently tells Safari to keep the canvas in CPU memory,
-		// avoiding expensive GPU readbacks on every getImageData call.
+	@action setupLiveCanvas(canvas: HTMLCanvasElement) {
+		this.liveCanvas = canvas
 		const ctx = canvas.getContext("2d", { willReadFrequently: true })
 		if (!ctx) return
 
 		const startLoop = () => {
 			const video = this.videoElement
 			if (!video) return
-
-			// 150ms (~6fps) is more reliable on iOS than 100ms —
-			// Safari throttles background/low-power tabs aggressively.
-			this.highlightInterval = setInterval(() => {
+			this.liveInterval = setInterval(() => {
 				if (!video.videoWidth || !video.videoHeight) return
-
 				if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
 				if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
-
-				try {
-					ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-				} catch {
-					// drawImage throws if video isn't ready — skip frame
-					return
-				}
-
-				if (this.scanner) {
-					try {
-						// On iOS, pre-process to boost colour edges before detection.
-						// The result is only used for jscanify — the canvas shown to
-						// the user still receives the original highlighted outline drawn
-						// back over it, so the preview never looks over-saturated.
-						const frameForDetection = this.preprocessFrameForDetection(canvas)
-						const highlighted = this.scanner.highlightPaper(frameForDetection)
-						ctx.clearRect(0, 0, canvas.width, canvas.height)
-						// Draw the original video frame first (natural colours for user)
-						ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-						// Then draw only the highlight overlay from jscanify on top
-						ctx.drawImage(highlighted, 0, 0)
-					} catch {
-						// No document detected — show raw frame, that's fine
-					}
-				}
-			}, 150)
+				try { ctx.drawImage(video, 0, 0, canvas.width, canvas.height) } catch { /* skip */ }
+			}, 100)
 		}
 
-		// The video element may not yet be set when the canvas inserts into DOM.
-		// Poll briefly, then fall back to the `playing` event.
 		const waitForVideo = () => {
 			const video = this.videoElement
-			if (video && video.readyState >= 2) {
-				startLoop()
-			} else if (video) {
-				video.addEventListener("playing", startLoop, { once: true })
-			} else {
-				setTimeout(waitForVideo, 50)
-			}
+			if (video && video.readyState >= 2) startLoop()
+			else if (video) video.addEventListener("playing", startLoop, { once: true })
+			else setTimeout(waitForVideo, 50)
 		}
 		waitForVideo()
 	}
 
-	@action async capturePhoto() {
-		if (this.isAtPageLimit) return
+	// ── Capture → Crop ─────────────────────────────────────────────────
 
-		const canvas = this.highlightCanvas
+	@action capturePhoto() {
+		const canvas = this.liveCanvas
 		if (!canvas) return
 
-		if (this.highlightInterval !== null) {
-			clearInterval(this.highlightInterval)
-			this.highlightInterval = null
-		}
-
-		this.isProcessingImage = true
+		this.stopLiveLoop()
 
 		try {
-			let scanned: HTMLCanvasElement
+			this.cropImageUrl = canvas.toDataURL("image/jpeg", 0.92)
+			this.isCameraOpen = false
+			// Keep stream alive for fast retake
+		} catch {
+			this.cameraError = "Could not capture image. Please try again."
+		}
+	}
 
-			if (this.scanner && this.libsReady) {
-				// Step 1: use the preprocessed (high-contrast greyscale) frame so
-				// jscanify can reliably find the document corners on iPhone.
-				const frameForDetect = this.preprocessFrameForDetection(canvas)
-				scanned = this.scanner.extractPaper(
-					frameForDetect,
-					MobileScannerComponent.A4_W,
-					MobileScannerComponent.A4_H,
-				)
+	// did-insert on the <img> in crop view — mounts Cropper.js onto it
+	@action async setupCropper(imgEl: HTMLImageElement) {
+		await this.loadCropperJs()
 
-				// Step 2: now that we know extraction works, re-run it on the raw
-				// colour frame so the saved image has natural colours (not greyscale).
-				// If it throws (shouldn't — corners are the same) keep the greyscale.
-				try {
-					scanned = this.scanner.extractPaper(
-						canvas,
-						MobileScannerComponent.A4_W,
-						MobileScannerComponent.A4_H,
-					)
-				} catch {
-					// keep greyscale scanned — at least it's correctly cropped
-				}
-			} else {
-				// Fallback: copy current frame to a fresh canvas
-				scanned = document.createElement("canvas")
-				scanned.width = canvas.width
-				scanned.height = canvas.height
-				scanned
-					.getContext("2d", { willReadFrequently: true })
-					?.drawImage(canvas, 0, 0)
-			}
+		const Cropper = (window as any).Cropper
+		if (!Cropper) return
 
-			const enhanced = this.enhanceImage(scanned)
+		// Destroy any previous instance
+		this.cropperInstance?.destroy()
+
+		this.cropperInstance = new Cropper(imgEl, {
+			viewMode: 1,          // crop box stays within the canvas
+			dragMode: "move",     // drag moves the image, not draws a new box
+			aspectRatio: NaN,     // free aspect ratio — user decides
+			autoCropArea: 0.95,   // start with crop box covering 95% of image
+			responsive: true,
+			restore: false,
+			guides: true,
+			center: true,
+			highlight: false,
+			cropBoxMovable: true,
+			cropBoxResizable: true,
+			toggleDragModeOnDblclick: false,
+			// iOS Safari: Cropper.js reads image pixels via canvas — must be same-origin.
+			// Since we captured from our own canvas this is always fine.
+			checkCrossOrigin: false,
+		})
+	}
+
+	// will-destroy on the <img> — cleans up Cropper.js when crop view unmounts
+	@action teardownCropper() {
+		this.cropperInstance?.destroy()
+		this.cropperInstance = null
+	}
+
+	@action confirmCrop() {
+		const cropper = this.cropperInstance
+		if (!cropper) return
+
+		try {
+			const croppedCanvas: HTMLCanvasElement = cropper.getCroppedCanvas({
+				width: MobileScannerComponent.A4_W,
+				height: MobileScannerComponent.A4_H,
+				imageSmoothingEnabled: true,
+				imageSmoothingQuality: "high",
+			})
+
+			const enhanced = this.enhanceImage(croppedCanvas)
 			this.capturedImages = [
 				...this.capturedImages,
 				enhanced.toDataURL("image/jpeg", 0.85),
 			]
-		} catch (_e) {
-			console.error("Capture error:", _e)
-			try {
-				// Last-resort: raw frame
-				this.capturedImages = [
-					...this.capturedImages,
-					canvas.toDataURL("image/jpeg", 0.7),
-				]
-			} catch {
-				// Canvas may be tainted (cross-origin) — tell the user
-				this.cameraError = "Could not capture image. Please try again."
-			}
+		} catch (e) {
+			console.error("Crop failed:", e)
 		} finally {
-			this.isProcessingImage = false
+			this.cleanupCropState()
 			this.stopCamera()
 		}
+	}
+
+	@action retakePhoto() {
+		this.cleanupCropState()
+		if (this.stream) {
+			// Stream still alive — just flip back to camera view
+			this.isCameraOpen = true
+		} else {
+			this.openCamera()
+		}
+	}
+
+	private cleanupCropState() {
+		this.cropperInstance?.destroy()
+		this.cropperInstance = null
+		this.cropImageUrl = null
 	}
 
 	// ── File input ─────────────────────────────────────────────────────
 
 	@action loadFromFile() {
 		const input = document.getElementById("scanner-file-input") as HTMLInputElement
-		if (input) input.click()
+		input?.click()
 	}
 
-	@action async processFileInput(e: Event) {
+	@action processFileInput(e: Event) {
 		const file = (e.target as HTMLInputElement).files?.[0]
 		if (!file) return
 
-		this.isProcessingImage = true
+		const reader = new FileReader()
+		reader.onload = (ev) => {
+			const dataUrl = ev.target?.result as string
+			if (dataUrl) this.cropImageUrl = dataUrl
+		}
+		reader.readAsDataURL(file)
 
-		try {
-			const dataUrl = await new Promise<string>((resolve) => {
-				const reader = new FileReader()
-				reader.onload = (ev) => resolve(ev.target?.result as string)
-				reader.readAsDataURL(file)
-			})
+		const input = document.getElementById("scanner-file-input") as HTMLInputElement
+		if (input) input.value = ""
+	}
 
-			const img = new Image()
-			// crossOrigin must be set before src on iOS
-			img.crossOrigin = "anonymous"
-			await new Promise<void>((resolve, reject) => {
-				img.onload = () => resolve()
-				img.onerror = () => reject(new Error("Image load failed"))
-				img.src = dataUrl
-			})
+	// ── Camera teardown ────────────────────────────────────────────────
 
-			await this.loadScannerLibs()
-
-			let scanned: HTMLCanvasElement
-
-			if (this.scanner && this.libsReady) {
-				scanned = this.scanner.extractPaper(
-					img,
-					MobileScannerComponent.A4_W,
-					MobileScannerComponent.A4_H,
-				)
-			} else {
-				const fallback = document.createElement("canvas")
-				fallback.width = img.naturalWidth || img.width
-				fallback.height = img.naturalHeight || img.height
-				fallback
-					.getContext("2d", { willReadFrequently: true })!
-					.drawImage(img, 0, 0)
-				scanned = fallback
-			}
-
-			const enhanced = this.enhanceImage(scanned)
-			this.capturedImages = [
-				...this.capturedImages,
-				enhanced.toDataURL("image/jpeg", 0.85),
-			]
-		} catch (_e) {
-			console.error("Failed to process file:", _e)
-		} finally {
-			this.isProcessingImage = false
-			const input = document.getElementById(
-				"scanner-file-input",
-			) as HTMLInputElement
-			if (input) input.value = ""
+	private stopLiveLoop() {
+		if (this.liveInterval !== null) {
+			clearInterval(this.liveInterval)
+			this.liveInterval = null
 		}
 	}
 
-	// ── Stop camera ────────────────────────────────────────────────────
-
 	@action stopCamera() {
-		if (this.highlightInterval !== null) {
-			clearInterval(this.highlightInterval)
-			this.highlightInterval = null
-		}
-		this.highlightCanvas = null
+		this.stopLiveLoop()
+		this.liveCanvas = null
 		this.videoElement = null
 		if (this.stream) {
-			this.stream.getTracks().forEach((track) => track.stop())
+			this.stream.getTracks().forEach((t) => t.stop())
 			this.stream = null
 		}
 		this.isCameraOpen = false
@@ -474,53 +294,30 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	// ── Image enhancement ──────────────────────────────────────────────
 
-	/**
-	 * Adaptive threshold enhancement.
-	 *
-	 * 1. Estimates local background brightness per tile (90th percentile).
-	 * 2. Bilinearly interpolates to produce a smooth background map.
-	 * 3. Normalises each pixel against its local background → paper → white.
-	 * 4. Contrast stretch + white-point clamp → ink stays dark, paper goes pure white.
-	 *
-	 * All canvas operations are wrapped in try/catch — iOS throws SecurityError
-	 * if the canvas is tainted by cross-origin content.
-	 */
 	private enhanceImage(canvas: HTMLCanvasElement): HTMLCanvasElement {
 		const out = document.createElement("canvas")
 		out.width = canvas.width
 		out.height = canvas.height
-
 		const ctx = out.getContext("2d", { willReadFrequently: true })
 		if (!ctx) return canvas
 
-		try {
-			ctx.drawImage(canvas, 0, 0)
-		} catch {
-			return canvas
-		}
+		try { ctx.drawImage(canvas, 0, 0) } catch { return canvas }
 
 		let imageData: ImageData
-		try {
-			imageData = ctx.getImageData(0, 0, out.width, out.height)
-		} catch {
-			// SecurityError — canvas is tainted on iOS
-			return canvas
-		}
+		try { imageData = ctx.getImageData(0, 0, out.width, out.height) }
+		catch { return canvas }
 
 		const data = imageData.data
 		const w = out.width
 		const h = out.height
 
-		// Greyscale luminance map
 		const grey = new Float32Array(w * h)
 		for (let i = 0; i < w * h; i++) {
-			const r = data[i * 4] ?? 0
-			const g = data[i * 4 + 1] ?? 0
-			const b = data[i * 4 + 2] ?? 0
-			grey[i] = 0.299 * r + 0.587 * g + 0.114 * b
+			grey[i] = 0.299 * (data[i * 4] ?? 0)
+				+ 0.587 * (data[i * 4 + 1] ?? 0)
+				+ 0.114 * (data[i * 4 + 2] ?? 0)
 		}
 
-		// Tile-based background estimation (90th percentile = paper brightness)
 		const TILES = 8
 		const tileW = Math.ceil(w / TILES)
 		const tileH = Math.ceil(h / TILES)
@@ -532,20 +329,15 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 				const y0 = Math.min(ty * tileH, h - 1)
 				const x1 = Math.min(x0 + tileW, w)
 				const y1 = Math.min(y0 + tileH, h)
-
 				const samples: number[] = []
-				for (let y = y0; y < y1; y++) {
-					for (let x = x0; x < x1; x++) {
+				for (let y = y0; y < y1; y++)
+					for (let x = x0; x < x1; x++)
 						samples.push(grey[y * w + x] ?? 0)
-					}
-				}
 				samples.sort((a, b) => a - b)
-				const p90idx = Math.floor(samples.length * 0.9)
-				bg[ty * (TILES + 1) + tx] = samples[p90idx] ?? 255
+				bg[ty * (TILES + 1) + tx] = samples[Math.floor(samples.length * 0.9)] ?? 255
 			}
 		}
 
-		// Per-pixel: normalise → contrast → clamp
 		const CONTRAST = 1.8
 		const WHITE_CLAMP = 240
 
@@ -554,13 +346,11 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 			const ty0 = Math.floor(ty)
 			const ty1 = Math.min(ty0 + 1, TILES)
 			const fy = ty - ty0
-
 			for (let x = 0; x < w; x++) {
 				const tx = x / tileW
 				const tx0 = Math.floor(tx)
 				const tx1 = Math.min(tx0 + 1, TILES)
 				const fx = tx - tx0
-
 				const b00 = bg[ty0 * (TILES + 1) + tx0] ?? 255
 				const b10 = bg[ty0 * (TILES + 1) + tx1] ?? 255
 				const b01 = bg[ty1 * (TILES + 1) + tx0] ?? 255
@@ -570,7 +360,6 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 					b10 * fx * (1 - fy) +
 					b01 * (1 - fx) * fy +
 					b11 * fx * fy
-
 				const idx = (y * w + x) * 4
 				for (let c = 0; c < 3; c++) {
 					const raw = data[idx + c] ?? 0
@@ -590,14 +379,9 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 
 	private loadJsPDF(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			// biome-ignore lint/suspicious/noExplicitAny: jsPDF loaded from CDN
-			if ((window as any).jspdf) {
-				resolve()
-				return
-			}
+			if ((window as any).jspdf) { resolve(); return }
 			const script = document.createElement("script")
-			script.src =
-				"https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+			script.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
 			script.onload = () => resolve()
 			script.onerror = () => reject(new Error("Failed to load jsPDF"))
 			document.head.appendChild(script)
@@ -609,25 +393,16 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		this.isGenerating = true
 		try {
 			await this.loadJsPDF()
-			// biome-ignore lint/suspicious/noExplicitAny: jsPDF loaded from CDN
 			const { jsPDF } = (window as any).jspdf
-			const pdf = new jsPDF({
-				orientation: "portrait",
-				unit: "mm",
-				format: "a4",
-			})
-			const pageWidth = pdf.internal.pageSize.getWidth()
-			const pageHeight = pdf.internal.pageSize.getHeight()
-
+			const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" })
+			const pw = pdf.internal.pageSize.getWidth()
+			const ph = pdf.internal.pageSize.getHeight()
 			for (let i = 0; i < this.capturedImages.length; i++) {
 				if (i > 0) pdf.addPage()
-				pdf.addImage(this.capturedImages[i], "JPEG", 0, 0, pageWidth, pageHeight)
+				pdf.addImage(this.capturedImages[i], "JPEG", 0, 0, pw, ph)
 			}
-
 			const blob = pdf.output("blob")
-			const file = new File([blob], `scan-${Date.now()}.pdf`, {
-				type: "application/pdf",
-			})
+			const file = new File([blob], `scan-${Date.now()}.pdf`, { type: "application/pdf" })
 			this.args.onScan(file)
 		} catch (e) {
 			console.error("Failed to generate PDF:", e)
@@ -636,13 +411,17 @@ export default class MobileScannerComponent extends Component<MobileScannerArgs>
 		}
 	}
 
+	// ── Lifecycle ──────────────────────────────────────────────────────
+
 	@action handleClose() {
 		this.stopCamera()
+		this.cleanupCropState()
 		this.args.onClose()
 	}
 
 	willDestroy() {
 		super.willDestroy()
 		this.stopCamera()
+		this.cleanupCropState()
 	}
 }
