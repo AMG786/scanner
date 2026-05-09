@@ -1,170 +1,217 @@
 {{! Full-screen scanner overlay }}
 <div class="fixed inset-0 z-50 bg-black flex flex-col">
 
-	{{#if this.isCameraOpen}}
-		{{! Camera view — single canvas fills the screen, video is display:none }}
-		<div class="relative flex-1 overflow-hidden">
+  {{#if (eq this.viewState 'camera')}}
+    {{! Camera view }}
+    <div class="relative flex-1 overflow-hidden">
+      {{! Hidden video provides the MediaStream }}
+      <video
+        id="scanner-video"
+        autoplay
+        playsinline
+        muted
+        class="hidden absolute"
+        {{did-insert this.setupVideoElement}}
+      ></video>
 
-			{{! Video element is NEVER shown — it only provides the MediaStream.
-			    display:none means it takes up zero space and is invisible. }}
-			<video
-				id="scanner-video"
-				autoplay
-				playsinline
-				muted
-				style="display:none"
-				{{did-insert this.setupVideoElement}}
-			/>
+      {{! Canvas shows live video + document detection }}
+      <canvas
+        id="scanner-highlight"
+        class="w-full h-full object-cover"
+        {{did-insert this.setupHighlightCanvas}}
+      ></canvas>
 
-			{{! This single canvas is the only thing the user sees.
-			    object-fit:cover via CSS ensures it fills the container
-			    without overflow, regardless of video resolution. }}
-			<canvas
-				id="scanner-highlight"
-				style="width:100%;height:100%;object-fit:contain;display:block;background:#000"
-				{{did-insert this.setupHighlightCanvas}}
-			/>
+      {{! Hint overlay }}
+      <div class="absolute top-12 inset-x-0 flex justify-center pointer-events-none">
+        <div class="bg-black/60 text-white px-4 py-2 rounded-full text-sm backdrop-blur-sm shadow-lg">
+          {{#if this.liveCorners}}
+            <span class="text-green-400 font-semibold inline-block mr-2 w-2 h-2 rounded-full bg-green-400"></span> Document Detected
+          {{else}}
+            Align document within frame
+          {{/if}}
+        </div>
+      </div>
 
-			{{! Capture controls }}
-			<div class="absolute bottom-0 inset-x-0 pb-10 flex justify-around items-center bg-gradient-to-t from-black/60 to-transparent pt-12">
-				<button
-					type="button"
-					class="text-white text-sm uppercase tracking-wide cursor-pointer"
-					{{on "click" this.stopCamera}}
-				>
-					Cancel
-				</button>
+      {{! Controls }}
+      <div class="absolute bottom-0 inset-x-0 pb-10 flex justify-around items-center bg-gradient-to-t from-black/80 to-transparent pt-16">
+        <button
+          type="button"
+          class="text-white text-sm uppercase tracking-wide cursor-pointer font-semibold"
+          {{on "click" this.stopCamera}}
+        >
+          Cancel
+        </button>
 
-				{{! Shutter button }}
-				<button
-					type="button"
-					aria-label="Capture photo"
-					class="w-18 h-18 rounded-full border-4 border-white bg-white/20 flex items-center justify-center cursor-pointer active:scale-95 transition-transform"
-					{{on "click" this.capturePhoto}}
-				>
-					<div class="w-14 h-14 bg-white rounded-full" />
-				</button>
+        {{! Capture button }}
+        <button
+          type="button"
+          aria-label="Capture photo"
+          class="w-18 h-18 rounded-full border-4 border-white bg-white/20 flex items-center justify-center cursor-pointer active:scale-95 transition-transform shadow-xl"
+          {{on "click" this.capturePhoto}}
+        >
+          <div class="w-14 h-14 bg-white rounded-full shadow-inner"></div>
+        </button>
 
-				<div class="w-16" />
-			</div>
-		</div>
+        <div class="w-16"></div>
+      </div>
+    </div>
 
-	{{else}}
-		{{! Preview and controls view }}
-		<p class="sr-only">Document Scanner</p>
+  {{else if (eq this.viewState 'adjust')}}
+    {{! Adjust screen }}
+    <div class="flex flex-col h-full bg-gray-950">
+      <div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white shadow-md z-10">
+        <button
+          type="button"
+          class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
+          {{on "click" this.cancelAdjust}}
+        >
+          Retake
+        </button>
+        <div class="text-sm font-semibold">Adjust Corners</div>
+        <button
+          type="button"
+          class="text-sm uppercase tracking-wide cursor-pointer text-green-400 hover:text-green-300 font-bold"
+          {{on "click" this.confirmAdjust}}
+        >
+          Confirm
+        </button>
+      </div>
 
-		<div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white">
-			<button
-				type="button"
-				class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
-				{{on "click" this.handleClose}}
-			>
-				<i class="ri-close-line mr-1" />Cancel
-			</button>
+      <div class="relative flex-1 overflow-hidden bg-black flex items-center justify-center" id="adjust-container">
+        {{! The image we took }}
+        <canvas id="preview-canvas" class="absolute shadow-2xl" {{did-insert this.setupPreviewCanvas}}></canvas>
+        {{! Overlay for dragging corners }}
+        <canvas id="corner-canvas" class="absolute z-10 touch-none" {{did-insert this.setupCornerCanvas}}></canvas>
+        
+        {{! Magnifier (managed by JS) }}
+        <div id="magnifier" class="hidden absolute pointer-events-none z-20 w-24 h-24 rounded-full border-4 border-white overflow-hidden shadow-2xl bg-black"></div>
+      </div>
 
-			<div class="text-sm font-semibold">
-				{{this.capturedImages.length}}
-				{{#if (eq this.capturedImages.length 1)}}page{{else}}pages{{/if}}
-				captured
-			</div>
+      <div class="p-4 bg-gray-900 text-center">
+        <p class="text-gray-400 text-sm mb-3">Drag corners to align with document edges</p>
+        <button
+          type="button"
+          class="bg-gray-800 text-white px-6 py-2 rounded-full text-sm font-medium border border-gray-700 hover:bg-gray-700 cursor-pointer transition-colors"
+          {{on "click" this.autoFixCorners}}
+        >
+          Auto Detect Edges
+        </button>
+      </div>
+    </div>
 
-			{{#if this.isAtPageLimit}}
-				<span class="text-xs text-yellow-400">Max 20 pages</span>
-			{{else}}
-				<button
-					type="button"
-					class="text-sm uppercase tracking-wide cursor-pointer text-white"
-					{{on "click" this.openCamera}}
-				>
-					<i class="ri-add-line" />Add Page
-				</button>
-			{{/if}}
-		</div>
+  {{else}}
+    {{! Preview screen (grid) }}
+    <div class="flex justify-between items-center px-4 py-3 bg-gray-900 text-white shadow-md z-10">
+      <button
+        type="button"
+        class="text-sm uppercase tracking-wide cursor-pointer text-gray-300 hover:text-white"
+        {{on "click" this.handleClose}}
+      >
+        Cancel
+      </button>
 
-		{{#if this.capturedImages.length}}
-			<div class="flex-1 overflow-y-auto p-4 grid grid-cols-2 gap-4 bg-gray-950">
-				{{#each this.capturedImagesWithIndex as |item|}}
-					<div class="relative flex flex-col gap-1">
-						<img
-							src={{item.url}}
-							alt="Page {{item.pageNumber}}"
-							class="w-full rounded-md border border-gray-700 object-cover"
-						/>
-						<button
-							type="button"
-							aria-label="Remove page {{item.pageNumber}}"
-							class="absolute top-1 right-1 w-6 h-6 rounded-full bg-red-600 text-white text-xs flex items-center justify-center cursor-pointer"
-							{{on "click" (fn this.removePage item.index)}}
-						>
-							<i class="ri-close-line" />
-						</button>
-						<div class="text-center text-gray-400 text-xs">
-							Page {{item.pageNumber}}
-						</div>
-					</div>
-				{{/each}}
-			</div>
+      <div class="text-sm font-semibold">
+        {{this.capturedImages.length}}
+        {{#if (eq this.capturedImages.length 1)}}page{{else}}pages{{/if}}
+        captured
+      </div>
 
-			<div class="p-4 bg-gray-900">
-				<button
-					type="button"
-					class="w-full bg-white text-black py-4 rounded-lg font-semibold uppercase tracking-wide cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-					disabled={{this.isGenerating}}
-					{{on "click" this.generatePDF}}
-				>
-					{{#if this.isGenerating}}
-						<i class="ri-loader-4-line animate-spin mr-2" />Generating PDF...
-					{{else}}
-						<i class="ri-upload-cloud-line mr-2" />
-						Upload
-						{{this.capturedImages.length}}
-						{{#if (eq this.capturedImages.length 1)}}Page{{else}}Pages{{/if}}
-						as PDF
-					{{/if}}
-				</button>
-			</div>
+      {{#if this.isAtPageLimit}}
+        <span class="text-xs text-yellow-400">Max 20 pages</span>
+      {{else}}
+        <button
+          type="button"
+          class="text-sm uppercase tracking-wide cursor-pointer text-white font-semibold"
+          {{on "click" this.openCamera}}
+        >
+          Add Page
+        </button>
+      {{/if}}
+    </div>
 
-		{{else}}
-			<div class="flex-1 flex flex-col justify-center items-center gap-6 text-white bg-gray-950">
-				<i class="ri-file-scan-line text-6xl text-gray-500" />
-				<div class="text-center">
-					<div class="text-xl font-semibold">No pages captured yet</div>
-					<div class="text-gray-400 text-sm mt-1">Tap the button below to open the camera</div>
-				</div>
+    {{#if this.capturedImages.length}}
+      <div class="flex-1 overflow-y-auto p-4 grid grid-cols-2 gap-4 bg-gray-950">
+        {{#each this.capturedImagesWithIndex as |item|}}
+          <div class="relative flex flex-col gap-1 group">
+            <img
+              src={{item.url}}
+              alt="Page {{item.pageNumber}}"
+              class="w-full rounded-md border border-gray-700 object-cover shadow-lg bg-gray-900 aspect-[1/1.414]"
+            />
+            <button
+              type="button"
+              class="absolute top-2 right-2 w-7 h-7 rounded-full bg-red-600/90 text-white text-xs flex items-center justify-center cursor-pointer shadow-md opacity-90 hover:opacity-100 hover:scale-105 transition-all"
+              {{on "click" (fn this.removePage item.index)}}
+            >
+              ✕
+            </button>
+            <div class="text-center text-gray-400 text-xs mt-1 font-medium">
+              Page {{item.pageNumber}}
+            </div>
+          </div>
+        {{/each}}
+      </div>
 
-				{{#if this.cameraError}}
-					<div class="bg-red-900/50 border border-red-700 rounded-md px-4 py-3 text-red-300 text-sm text-center max-w-xs">
-						{{this.cameraError}}
-					</div>
-				{{/if}}
+      <div class="p-4 bg-gray-900 border-t border-gray-800">
+        <button
+          type="button"
+          class="w-full bg-white text-black py-4 rounded-xl font-bold uppercase tracking-wide cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:bg-gray-100 transition-colors"
+          disabled={{this.isGenerating}}
+          {{on "click" this.generatePDF}}
+        >
+          {{#if this.isGenerating}}
+            <span class="flex items-center justify-center gap-2">
+              <span class="w-4 h-4 border-2 border-black border-t-transparent rounded-full animate-spin"></span>
+              Generating PDF...
+            </span>
+          {{else}}
+            Upload {{this.capturedImages.length}} Page(s) as PDF
+          {{/if}}
+        </button>
+      </div>
 
-				<div class="flex gap-3">
-					<button
-						type="button"
-						class="bg-white text-black px-8 py-3 rounded-full font-semibold cursor-pointer"
-						{{on "click" this.openCamera}}
-					>
-						<i class="ri-camera-line mr-2" />Start Scanning
-					</button>
+    {{else}}
+      <div class="flex-1 flex flex-col justify-center items-center gap-6 text-white bg-gray-950">
+        <div class="text-center">
+          <div class="text-xl font-semibold mb-2">No pages captured yet</div>
+          <div class="text-gray-400 text-sm">Tap below to start scanning</div>
+        </div>
 
-					<button
-						type="button"
-						class="bg-gray-700 text-white px-8 py-3 rounded-full font-semibold cursor-pointer"
-						{{on "click" this.loadFromFile}}
-					>
-						<i class="ri-image-line mr-2" />Load from File
-					</button>
-				</div>
+        {{#if this.cameraError}}
+          <div class="bg-red-900/50 border border-red-700 rounded-md px-4 py-3 text-red-300 text-sm text-center max-w-xs">
+            {{this.cameraError}}
+          </div>
+        {{/if}}
 
-				<input
-					type="file"
-					accept="image/*"
-					class="hidden"
-					id="scanner-file-input"
-					{{on "change" this.processFileInput}}
-				/>
-			</div>
-		{{/if}}
-	{{/if}}
+        <div class="flex flex-col gap-4 w-64 mt-4">
+          <button
+            type="button"
+            class="bg-white text-black w-full py-3.5 rounded-full font-bold cursor-pointer shadow-lg hover:bg-gray-100 transition-colors flex items-center justify-center gap-2"
+            {{on "click" this.openCamera}}
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Start Scanning
+          </button>
+
+          <button
+            type="button"
+            class="bg-gray-800 text-white border border-gray-700 w-full py-3.5 rounded-full font-semibold cursor-pointer shadow-md hover:bg-gray-700 transition-colors flex items-center justify-center gap-2"
+            {{on "click" this.loadFromFile}}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            Load from File
+          </button>
+        </div>
+
+        <input
+          type="file"
+          accept="image/*"
+          class="hidden"
+          id="scanner-file-input"
+          {{on "change" this.processFileInput}}
+        />
+      </div>
+    {{/if}}
+  {{/if}}
 
 </div>
